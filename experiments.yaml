@@ -1,0 +1,48 @@
+gpu_counts:
+  - 2
+
+experiments:
+  - name: "qwen-3.6-35b-a3b-sxm"
+    model: "Qwen/Qwen3.6-35B-A3B-FP8"
+    prompt: "Summarize the following text: The NVIDIA H100 SXM platform with NVLink provides extremely high bandwidth for large-scale multi-GPU inference."
+    batch_size: 4
+    sequence_length: 2048
+    num_steps: 40
+    ep: 1
+    dp: 1
+    tp: 2
+    pp: 1
+    vllm_args:
+      - "--trust-remote-code"
+      - "--enable-expert-parallel"
+      - "--tensor-parallel-size"
+      - "2"
+      - "--gpu-memory-utilization"
+      - "0.95"
+      - "--max-num-batched-tokens"
+      - "8192"
+      - "--max-num-seqs"
+      - "256"
+      - "--max-model-len"
+      - "auto"
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser"
+      - "qwen3_xml"
+      - "--reasoning-parser"
+      - "qwen3"
+      - "--mm-encoder-tp-mode"
+      - "data"
+    guidellm_command:
+      - "run"
+      - "--backend"
+      - "kind=openai_http,target=http://localhost:8000/v1,model=Qwen/Qwen3.6-35B-A3B-FP8,max_tokens=1024"
+      - "--profile"
+      - "kind=concurrent,streams=16,warmup=0.1,cooldown=0.1"
+      - "--constraint"
+      - "kind=max_duration,seconds=300"
+      - "--constraint"
+      - "kind=over_saturation"
+      - "--data"
+      - "kind=synthetic_text,prompt_tokens=16384,output_tokens=1024"
+      - "--output"
+      - "kind=json,path=/workspace/tp2-ep-prof-run.json"
