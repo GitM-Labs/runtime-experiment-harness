@@ -3,3 +3,7 @@ __pycache__/
 plots/
 experiment_results.json
 .venv
+dist/
+build/
+*.egg-info/
+.pytest_cache/

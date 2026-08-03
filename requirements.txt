@@ -1,4 +1,4 @@
-pyyaml>=6.0
-plotly>=5.20.0
-aiofiles>=23.0.0
-rich>=13.0.0
+# Dependencies are declared in pyproject.toml -- this file just installs the
+# project so the two can never drift apart.
+#   pip install -r requirements.txt
+-e .[plot]

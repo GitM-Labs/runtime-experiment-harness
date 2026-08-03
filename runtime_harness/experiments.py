@@ -1,5 +1,7 @@
-#!/usr/bin/env python3
-import argparse
+"""Experiment orchestration: launch vLLM, drive guidellm, collect results."""
+
+from __future__ import annotations
+
 import asyncio
 import dataclasses
 import json
@@ -9,16 +11,79 @@ import shlex
 import shutil
 import subprocess
 import sys
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
-import plotly.graph_objects as go
+try:
+    import plotly.graph_objects as go
+except ModuleNotFoundError:  # pragma: no cover - handled when optional plotting dependency is absent.
+    go = None
+
 import yaml
 from rich.console import Console
 
+from . import __version__
+from .banner import harness_banner
+from .checks import DEFAULT_EXPERIMENTS_DIR, run_preflight
+
 console = Console()
 
-PROJECT_ROOT = Path(__file__).parent
-DEFAULT_CONFIG = PROJECT_ROOT / "experiments.yaml"
+# Config and outputs resolve against the invocation directory, never the install
+# location -- site-packages is often read-only and is never the user's workspace.
+DEFAULT_CONFIG_NAME = "experiments.yaml"
+BUNDLED_CONFIG = Path(__file__).parent / "data" / DEFAULT_CONFIG_NAME
+
+
+def utc_timestamp() -> str:
+    """Filename-safe UTC stamp: 20260803T142305Z.
+
+    Deliberately not literal `date:time` -- colons are illegal in filenames on
+    macOS and Windows and need quoting in every shell command that touches them.
+    """
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def experiment_id(experiment: "Experiment", gpu_count: int) -> str:
+    """Stable identifier for one (experiment, GPU count) pair in the sweep."""
+    return f"{experiment.name}-gpu{gpu_count}"
+
+
+def save_experiment_result(result: dict, experiments_dir: Path, exp_id: str, timestamp=None) -> Path:
+    """Write one guidellm result to experiments/<id>/<timestamp>_<id>.json.
+
+    If guidellm was configured to emit its own JSON report (via
+    `--output kind=json,path=...`), that artifact is copied in alongside so the
+    run directory is self-contained.
+    """
+    timestamp = timestamp or utc_timestamp()
+    run_dir = Path(experiments_dir) / exp_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    output_file = run_dir / f"{timestamp}_{exp_id}.json"
+    payload = dict(result)
+    payload["experiment_id"] = exp_id
+    payload["timestamp"] = timestamp
+    payload["latency"] = parse_latency_from_output(result.get("stdout", ""))
+
+    with output_file.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+    guidellm_report = result.get("guidellm_output_path")
+    if guidellm_report and Path(guidellm_report).is_file():
+        shutil.copyfile(guidellm_report, run_dir / f"{timestamp}_{exp_id}_guidellm.json")
+
+    console.log(f"[green]Saved {exp_id} result to {output_file}[/green]")
+    return output_file
+
+
+def guidellm_output_path(experiment: "Experiment"):
+    """Extract the report path guidellm was told to write, if any."""
+    for arg in list(experiment.guidellm_command) + list(experiment.guidellm_args):
+        match = re.search(r"kind=json,\s*path=([^,\s]+)", arg)
+        if match:
+            return match.group(1)
+    return None
 
 
 @dataclasses.dataclass
@@ -47,45 +112,6 @@ def normalize_arg_list(raw):
     if isinstance(raw, list):
         return [str(item) for item in raw]
     raise ValueError("Argument lists must be strings or lists.")
-
-
-def run_command(command, capture_output=False, check=True, env=None):
-    console.log(f"[blue]Running command:[/blue] {command}")
-    process = subprocess.run(
-        shlex.split(command),
-        capture_output=capture_output,
-        text=True,
-        check=check,
-        env=env,
-    )
-    return process.stdout if capture_output else None
-
-
-def ensure_dependencies():
-    console.rule("Installing runtime dependencies")
-    deps = ["vllm", "guidellm", "plotly", "pyyaml", "rich"]
-    command = f"{sys.executable} -m pip install {' '.join(deps)}"
-    run_command(command)
-    console.log("[green]Dependencies installed successfully[/green]")
-
-
-def parse_gpu_topology():
-    if shutil.which("nvidia-smi") is None:
-        raise FileNotFoundError("nvidia-smi not found in PATH. NVIDIA drivers must be installed.")
-
-    topo_raw = run_command("nvidia-smi topo --matrix", capture_output=True)
-    gpu_count = 0
-    nvlink_matrix = []
-
-    for line in topo_raw.splitlines():
-        if line.startswith("GPU") and "CPU" not in line:
-            parts = re.split(r"\s+", line.strip())
-            if parts:
-                gpu_count += 1
-                nvlink_matrix.append(parts[1:gpu_count + 1])
-
-    nvlink_available = any("NV" in cell.upper() for row in nvlink_matrix for cell in row)
-    return gpu_count, nvlink_available, topo_raw
 
 
 def load_experiments(config_path: Path):
@@ -132,6 +158,26 @@ def build_vllm_command(experiment: Experiment, gpu_count: int):
     return command
 
 
+def vllm_port(experiment: Experiment, default: int = 8000) -> int:
+    """Port the manifest asked vLLM to serve on, so readiness polls the right place."""
+    args = experiment.vllm_args
+    for index, arg in enumerate(args):
+        if arg == "--port" and index + 1 < len(args):
+            return int(args[index + 1])
+        if arg.startswith("--port="):
+            return int(arg.split("=", 1)[1])
+    return default
+
+
+def server_is_ready(port: int, timeout: float = 2.0) -> bool:
+    url = f"http://localhost:{port}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return 200 <= response.status < 300
+    except Exception:
+        return False
+
+
 def build_guidellm_command(experiment: Experiment):
     if experiment.guidellm_command:
         return [sys.executable, "-m", "guidellm"] + experiment.guidellm_command
@@ -158,11 +204,19 @@ def build_guidellm_command(experiment: Experiment):
     return command
 
 
-async def start_vllm_server(experiment: Experiment, gpu_count: int):
+async def start_vllm_server(experiment: Experiment, gpu_count: int, startup_timeout: float = 900.0):
+    """Launch vLLM with the manifest's parameters and wait until it serves traffic.
+
+    Loading a large checkpoint can take many minutes on a cold HF cache, so this
+    polls /health until ready rather than assuming a fixed startup delay.
+    """
     console.rule(f"Starting vLLM server: {experiment.name} on {gpu_count} GPUs")
     command = build_vllm_command(experiment, gpu_count)
+    port = vllm_port(experiment)
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(gpu_count))
+
+    console.log(f"[blue]vLLM command:[/blue] {shlex.join(command)}")
 
     process = subprocess.Popen(
         command,
@@ -172,34 +226,67 @@ async def start_vllm_server(experiment: Experiment, gpu_count: int):
         env=env,
     )
 
-    await asyncio.sleep(6)
-    if process.poll() is not None:
-        stderr = process.stderr.read() if process.stderr else ""
-        console.log(f"[red]vLLM server failed to start for {experiment.name}[/red]")
-        console.log(stderr)
+    def failure(stderr: str):
         return {
             "name": experiment.name,
             "engine": "vllm",
             "gpu_count": gpu_count,
+            "port": port,
             "success": False,
             "stdout": "",
             "stderr": stderr,
         }, None
 
-    console.log(f"[green]vLLM server started for {experiment.name}[/green]")
+    deadline = asyncio.get_running_loop().time() + startup_timeout
+    while True:
+        if process.poll() is not None:
+            stderr = process.stderr.read() if process.stderr else ""
+            console.log(f"[red]vLLM server exited during startup for {experiment.name}[/red]")
+            console.log(stderr)
+            return failure(stderr)
+
+        if await asyncio.to_thread(server_is_ready, port):
+            break
+
+        if asyncio.get_running_loop().time() >= deadline:
+            console.log(
+                f"[red]vLLM server did not become ready within {startup_timeout:.0f}s "
+                f"for {experiment.name}[/red]"
+            )
+            process.terminate()
+            return failure(f"Timed out waiting for http://localhost:{port}/health")
+
+        await asyncio.sleep(3)
+
+    console.log(f"[green]vLLM server ready for {experiment.name} on port {port}[/green]")
     return {
         "name": experiment.name,
         "engine": "vllm",
         "gpu_count": gpu_count,
+        "port": port,
         "success": True,
         "stdout": "",
         "stderr": "",
     }, process
 
 
-def run_guidellm(experiment: Experiment):
+def run_guidellm(experiment: Experiment, reports_dir=None, exp_id=None, timestamp=None):
+    """Run guidellm, directing its JSON report into the reports directory.
+
+    A manifest that already specifies `--output kind=json,path=...` is left
+    alone -- an explicit path in the config beats our default.
+    """
     console.rule(f"Running guidellm: {experiment.name}")
     command = build_guidellm_command(experiment)
+
+    report_path = guidellm_output_path(experiment)
+    if report_path is None and reports_dir is not None:
+        exp_id = exp_id or experiment.name
+        timestamp = timestamp or utc_timestamp()
+        report_path = str(Path(reports_dir) / f"{timestamp}_{exp_id}_guidellm.json")
+        Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+        command += ["--output", f"kind=json,path={report_path}"]
+
     process = subprocess.run(command, capture_output=True, text=True)
     success = process.returncode == 0
     if not success:
@@ -211,6 +298,7 @@ def run_guidellm(experiment: Experiment):
         "success": success,
         "stdout": process.stdout,
         "stderr": process.stderr,
+        "guidellm_output_path": report_path,
     }
 
 
@@ -222,6 +310,10 @@ def parse_latency_from_output(output: str):
 
 
 async def plot_results_async(results: list[dict], output_dir: Path):
+    if go is None:
+        console.log("[yellow]Plotly is not installed; skipping HTML result plotting.[/yellow]")
+        return None
+
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / f"results_{len(results)}.html"
 
@@ -250,14 +342,35 @@ async def plot_results_async(results: list[dict], output_dir: Path):
     return output_file
 
 
-async def run_all_experiments(config_path: Path, install: bool):
-    if install:
-        ensure_dependencies()
+def render_runtime_banner(model: str | None = None, version: str | None = None) -> str:
+    """Startup artwork. Delegates to the block-font renderer in banner.py."""
+    return harness_banner(version or __version__, model)
 
-    gpu_count, nvlink_available, topo_raw = parse_gpu_topology()
-    console.print(f"[bold]Detected GPUs:[/bold] {gpu_count}")
-    console.print(f"[bold]NVLink available:[/bold] {nvlink_available}")
-    console.print("[bold]Topology matrix:[/bold]\n" + topo_raw)
+
+async def run_all_experiments(
+    config_path: Path,
+    install: bool = True,
+    output_dir: Path | None = None,
+    hf_home: Path | None = None,
+    experiments_dir: Path | None = None,
+    reports_dir: Path | None = None,
+):
+    output_dir = Path(output_dir) if output_dir is not None else Path.cwd()
+
+    # See cmd_check: the banner carries its own ANSI colour, so bypass rich.
+    print(render_runtime_banner())
+
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"No experiment manifest at {config_path}. Run 'rex init' to write a starter manifest."
+        )
+
+    gpu_count, _nvlink, _topo, _hf_home, experiments_dir, reports_dir = run_preflight(
+        install=install,
+        hf_home=hf_home,
+        experiments_dir=experiments_dir if experiments_dir is not None else output_dir / DEFAULT_EXPERIMENTS_DIR,
+        reports_dir=reports_dir,
+    )
 
     gpu_counts, experiments = load_experiments(config_path)
     results = []
@@ -269,11 +382,13 @@ async def run_all_experiments(config_path: Path, install: bool):
 
     for exp in experiments:
         for count in desired_gpu_counts:
+            exp_id = experiment_id(exp, count)
+            timestamp = utc_timestamp()
             vllm_result, server_process = await start_vllm_server(exp, count)
             results.append(vllm_result)
 
             if vllm_result["success"]:
-                guidellm_result = run_guidellm(exp)
+                guidellm_result = run_guidellm(exp, reports_dir, exp_id, timestamp)
                 results.append(guidellm_result)
             else:
                 guidellm_result = {
@@ -285,6 +400,9 @@ async def run_all_experiments(config_path: Path, install: bool):
                 }
                 results.append(guidellm_result)
 
+            guidellm_result["gpu_count"] = count
+            save_experiment_result(guidellm_result, experiments_dir, exp_id, timestamp)
+
             if server_process is not None and server_process.poll() is None:
                 server_process.terminate()
                 try:
@@ -292,46 +410,15 @@ async def run_all_experiments(config_path: Path, install: bool):
                 except subprocess.TimeoutExpired:
                     server_process.kill()
 
-            task = asyncio.create_task(plot_results_async(results.copy(), PROJECT_ROOT / "plots"))
+            task = asyncio.create_task(plot_results_async(results.copy(), output_dir / "plots"))
             pending_plots.append(task)
 
     if pending_plots:
         await asyncio.gather(*pending_plots)
 
-    output_json = PROJECT_ROOT / "experiment_results.json"
+    output_json = output_dir / "experiment_results.json"
+    output_json.parent.mkdir(parents=True, exist_ok=True)
     with output_json.open("w", encoding="utf-8") as handle:
         json.dump(results, handle, indent=2)
     console.log(f"[green]Saved results to {output_json}[/green]")
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Run vLLM / guidellm experiments on H100 NVLink clusters.")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="Path to experiments YAML manifest.")
-    parser.add_argument("--install", action="store_true", help="Install vllm, guidellm, and plotting dependencies before running.")
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    try:
-        asyncio.run(run_all_experiments(args.config, args.install))
-    except Exception as exc:
-        console.print(f"[bold red]Experiment harness failed:[/bold red] {exc}")
-        sys.exit(1)
-
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Run vLLM / guidellm experiments on H100 NVLink clusters.")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="Path to experiments YAML manifest.")
-    parser.add_argument("--install", action="store_true", help="Install vllm, guidellm, and plotting dependencies before running.")
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    try:
-        asyncio.run(run_all_experiments(args.config, args.install))
-    except Exception as exc:
-        console.print(f"[bold red]Experiment harness failed:[/bold red] {exc}")
-        sys.exit(1)
+    return results
