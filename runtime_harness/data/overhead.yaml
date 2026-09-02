@@ -1,0 +1,71 @@
+# What CUPTI collection costs the workload it is measuring.
+#
+#   rex run --config experiments-overhead.yaml
+#   rex compare experiments/tracer-overhead-gpu1
+#
+# Three arms, one server command, one client workload, one seed. The only thing
+# that differs between them is the state of the collector:
+#
+#   off     no CUPTI at all. gitm CLEARS the injection variables rather than
+#           merely not setting them -- one left exported in the shell from an
+#           earlier capture would attach the collector to the arm whose entire
+#           purpose is not to have one, the baseline would land on top of the
+#           traced arms, and the reading of that is "collection is free".
+#   cupti   kernel collection: CONCURRENT_KERNEL + MEMCPY + SYNCHRONIZATION.
+#   nvtx    the correlation chain too: RUNTIME + DRIVER + MARKER, plus vLLM's
+#           --enable-layerwise-nvtx-tracing. This is the arm that prices layer/op
+#           attribution, which is the expensive half.
+#
+# repeat: 3 with the arms interleaved (off, cupti, nvtx, off, ...) rather than
+# three of each in a row. Anything that drifts over the session -- thermals, a
+# co-tenant, a background compaction -- otherwise biases whichever arm happened to
+# run during it, and a 3-run block is exactly the wrong shape for that.
+#
+# The comparison is grouped on what each run REPORTED in serving_summary.json, not
+# on the arm the harness asked for. Those disagree precisely when the measurement
+# is worthless, and `rex compare` says so instead of averaging it in.
+#
+# ~9 server starts at ~2 minutes of weight load each, plus 9 windows. Budget an
+# hour and run it on an idle box.
+
+gpu_counts:
+  - 1
+
+experiments:
+  - name: "tracer-overhead"
+    model: "Qwen/Qwen3.6-35B-A3B"
+    vllm_args:
+      - "--trust-remote-code"
+      - "--gpu-memory-utilization"
+      - "0.95"
+      - "--max-num-batched-tokens"
+      - "8192"
+      - "--max-num-seqs"
+      - "256"
+      - "--max-model-len"
+      - "auto"
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser"
+      - "qwen3_xml"
+      - "--reasoning-parser"
+      - "qwen3"
+      - "--mm-encoder-tp-mode"
+      - "data"
+      - "--tensor-parallel-size"
+      - "1"
+    capture:
+      # Saturating load: concurrency matches --max-num-seqs, so the engine is the
+      # bottleneck rather than the client. Overhead measured on an idle engine
+      # measures the client.
+      requests: 512
+      concurrency: 256
+      input_tokens: 1024
+      output_tokens: 256
+      seed: 42
+      warmup: 8
+      arms: ["off", "cupti", "nvtx"]
+      repeat: 3
+      # The trace is not the product here -- the serving summary is -- and the
+      # layer tables would cost a pass over nine multi-GB traces.
+      analyze: true
+    metadata: {question: "tracer overhead"}
