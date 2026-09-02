@@ -77,3 +77,84 @@ def test_check_installs_by_default(monkeypatch):
 def test_run_fails_cleanly_when_manifest_missing(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert cli.main(["run"]) == 1
+
+
+# --- sweep expansion --------------------------------------------------------
+
+
+def test_variants_expand_into_one_experiment_each(tmp_path):
+    """A sweep is written once and expanded, not copy-pasted N times. Duplicated
+    blocks drift apart on the fields nobody meant to vary, and a sweep whose arms
+    differ in more than the thing under test measures nothing."""
+    from runtime_harness.experiments import load_experiments
+
+    config = tmp_path / "e.yaml"
+    config.write_text(
+        "gpu_counts: [1]\n"
+        "experiments:\n"
+        "  - name: base\n"
+        "    model: m\n"
+        "    prompt: p\n"
+        "    vllm_args: ['--shared']\n"
+        "    variants:\n"
+        "      - name: a\n"
+        "        vllm_args: ['--only-a']\n"
+        "      - name: b\n"
+        "        vllm_args: ['--only-b']\n",
+        encoding="utf-8",
+    )
+
+    _, experiments = load_experiments(config)
+
+    assert [e.name for e in experiments] == ["base-a", "base-b"]
+    # base flags reach every arm; variant flags reach only their own
+    assert experiments[0].vllm_args == ["--shared", "--only-a"]
+    assert experiments[1].vllm_args == ["--shared", "--only-b"]
+    assert experiments[0].metadata["variant"] == "a"
+
+
+def test_an_entry_without_variants_is_unchanged(tmp_path):
+    from runtime_harness.experiments import load_experiments
+
+    config = tmp_path / "e.yaml"
+    config.write_text(
+        "gpu_counts: [1]\n"
+        "experiments:\n"
+        "  - name: solo\n"
+        "    model: m\n"
+        "    prompt: p\n"
+        "    vllm_args: ['--x']\n",
+        encoding="utf-8",
+    )
+
+    _, experiments = load_experiments(config)
+
+    assert [e.name for e in experiments] == ["solo"]
+    assert experiments[0].vllm_args == ["--x"]
+
+
+def test_each_variant_writes_its_own_guidellm_report():
+    """The report path is baked into a --output argument. Shared across arms, every
+    arm overwrites the last and the run directory still looks complete — holding one
+    arm's numbers under eight arms' names."""
+    from runtime_harness.experiments import retarget_output_path
+
+    command = ["--output", "kind=json,path=/w/run.json"]
+
+    a = retarget_output_path(command, "eager")
+    b = retarget_output_path(command, "full")
+
+    assert a == ["--output", "kind=json,path=/w/run-eager.json"]
+    assert b == ["--output", "kind=json,path=/w/run-full.json"]
+    assert a != b
+
+
+def test_variant_without_a_name_is_rejected():
+    """Unnamed variants would collide on both experiment id and report path, and
+    the collision is silent — one arm's result under another arm's name."""
+    import pytest
+
+    from runtime_harness.experiments import expand_variants
+
+    with pytest.raises(ValueError, match="needs a name"):
+        expand_variants({"name": "base", "variants": [{"vllm_args": ["--x"]}]})

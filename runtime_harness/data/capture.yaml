@@ -1,0 +1,116 @@
+# Kernel capture on Qwen3.6-35B-A3B: what ran, where it ran, and in which phase.
+#
+#   rex run --config experiments-capture.yaml
+#
+# Every entry here is driven by `gitm capture serve`, not by guidellm. The two are
+# exclusive by construction: the CUDA driver reads CUDA_INJECTION64_PATH exactly
+# once, at CUDA init, so the collector has to be in the environment before the
+# server process exists. gitm therefore owns the server for a capture, and the
+# harness owns only the sweep around it.
+#
+# WHAT NOT TO PUT IN vllm_args:
+#   --enable-layerwise-nvtx-tracing        added by the `nvtx` arm
+# Adding it by hand pushes NVTX ranges in every arm, including the ones whose
+# throughput is supposed to be range-free, and the cost lands in the comparison
+# without appearing anywhere in the configuration.
+
+gpu_counts:
+  - 1
+
+experiments:
+
+  # --- 1. what the kernels are -----------------------------------------------
+  # Eager, long outputs: a decode-dominated window with no graph capture to hide
+  # kernel boundaries. Produces kernel_breakdown.json -- time by taxonomy bucket.
+  - name: "qwen-eager"
+    model: "Qwen/Qwen3.6-35B-A3B"
+    vllm_args:
+      - "--trust-remote-code"
+      - "--tensor-parallel-size"
+      - "1"
+      - "--max-model-len"
+      - "16384"
+      - "--enforce-eager"
+    capture:
+      requests: 64
+      concurrency: 8
+      input_tokens: 512
+      output_tokens: 512
+      warmup: 8
+      arms: ["cupti"]
+    metadata: {question: "kernel mix", graphs: none}
+
+  # --- 2. which layer and which op -------------------------------------------
+  # The same server with the NVTX correlation chain on. This is the only arm that
+  # can answer "which op is the MoE time in": every other arm's kernels come back
+  # with range_op null, because an anonymous nvjet GEMM is not identifiable from
+  # its name. Shorter outputs than above -- the ranges cost throughput, so the
+  # window is sized to resolve ops, not to measure speed.
+  - name: "qwen-nvtx"
+    model: "Qwen/Qwen3.6-35B-A3B"
+    vllm_args:
+      - "--trust-remote-code"
+      - "--tensor-parallel-size"
+      - "1"
+      - "--max-model-len"
+      - "16384"
+      - "--enforce-eager"
+    capture:
+      requests: 32
+      concurrency: 8
+      input_tokens: 512
+      output_tokens: 64
+      warmup: 8
+      arms: ["nvtx"]
+    metadata: {question: "layer/op attribution", graphs: none}
+
+  # --- 3. decode-heavy shape --------------------------------------------------
+  # 32 in / 256 out: almost all decode. Read against entry 1 to see which buckets
+  # grow when prefill is taken out of the mix.
+  - name: "qwen-decode"
+    model: "Qwen/Qwen3.6-35B-A3B"
+    vllm_args:
+      - "--trust-remote-code"
+      - "--tensor-parallel-size"
+      - "1"
+      - "--max-model-len"
+      - "16384"
+      - "--enforce-eager"
+      - "--enable-mfu-metrics"
+      - "--enable-logging-iteration-details"
+    capture:
+      requests: 32
+      concurrency: 8
+      input_tokens: 32
+      output_tokens: 256
+      warmup: 8
+      arms: ["nvtx"]
+    metadata: {question: "decode-only mix", graphs: none}
+
+  # --- 4. prefill vs decode, under graphs -------------------------------------
+  # No --enforce-eager, so CUDA graphs are live. `rex run` prints the prefill/decode
+  # split for this capture; `rex analyze <dir>` reprints it later.
+  #
+  # Trust it only as far as its attribution line says: most kernels are byte-
+  # identical in both phases and inherit the phase of the nearest kernel that names
+  # one. A median gap of microseconds means the neighbour is in the same engine
+  # step. Milliseconds means the inference crossed a step boundary -- and under
+  # chunked prefill a single step genuinely mixes both phases, which no name can
+  # separate.
+  - name: "qwen-graph"
+    model: "Qwen/Qwen3.6-35B-A3B"
+    vllm_args:
+      - "--trust-remote-code"
+      - "--tensor-parallel-size"
+      - "1"
+      - "--max-model-len"
+      - "16384"
+      - "--enable-mfu-metrics"
+    capture:
+      requests: 32
+      concurrency: 8
+      input_tokens: 512
+      output_tokens: 64
+      warmup: 8
+      arms: ["cupti"]
+    metadata: {question: "prefill vs decode", graphs: full}

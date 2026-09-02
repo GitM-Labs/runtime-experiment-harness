@@ -1,0 +1,109 @@
+# CUDA-graph modes and speculative decoding, measured in kernels rather than in
+# end-to-end throughput.
+#
+#   rex run --config experiments-cudagraph-spec-capture.yaml
+#   rex compare experiments/qwen36-35b-a3b-cap-*-gpu1
+#
+# The companion to experiments-cudagraph-spec.yaml. That one drives guidellm and
+# answers "how fast does this arm serve"; this one captures kernels and answers
+# "what did the arm actually run" -- GPU-active share, the bucket mix, and (for
+# the graph arms) how much of decode stopped appearing as individual launches.
+#
+# Ordering is deliberate. full-and-piecewise is vLLM's own default and runs FIRST,
+# so a misconfigured pod fails on the control arm rather than seven arms in. eager
+# runs LAST because it is the slowest by far -- a prior H200 capture put it at 14%
+# GPU active against 46.5% under graphs -- so losing it to a timeout costs least.
+#
+# READ BEFORE TRUSTING THE RESULTS: vLLM *resolves* cudagraph_mode and may
+# downgrade it. A hybrid model with mamba/linear-attention layers constrains
+# PIECEWISE, so an arm can ask for one mode and run another without failing:
+#
+#     grep -h "cudagraph_mode" experiments/*/*/server.log
+#
+# Two arms that silently resolved to the same mode differ only by noise, and that
+# reads as "the mode does not matter".
+#
+# A capture under graphs also under-attributes on purpose: replayed graph work is
+# not a launch, so kernel_breakdown's gpu_active_share drops without the GPU doing
+# less. Compare the arms' serving throughput alongside -- that is the number the
+# graph modes are supposed to move.
+
+gpu_counts:
+  - 1
+
+experiments:
+  - name: "qwen36-35b-a3b-cap"
+    model: "Qwen/Qwen3.6-35B-A3B-FP8"
+    vllm_args:
+      - "--trust-remote-code"
+      - "--tensor-parallel-size"
+      - "1"
+      - "--gpu-memory-utilization"
+      - "0.95"
+      - "--max-num-batched-tokens"
+      - "8192"
+      - "--max-num-seqs"
+      - "256"
+      - "--max-model-len"
+      - "auto"
+      - "--enable-mfu-metrics"
+
+    capture:
+      requests: 128
+      concurrency: 32
+      input_tokens: 512
+      output_tokens: 128
+      warmup: 8
+      arms: ["cupti"]
+
+    # Variant vllm_args are appended AFTER the base list, so a variant can override
+    # a base flag -- vLLM's parser takes the last occurrence.
+    variants:
+
+      # --- control ---------------------------------------------------------
+      - name: "full-and-piecewise"
+        vllm_args: ["--compilation-config", '{"cudagraph_mode": "FULL_AND_PIECEWISE"}']
+        metadata: {cudagraph_mode: FULL_AND_PIECEWISE, spec: none}
+
+      # --- cudagraph modes --------------------------------------------------
+      - name: "piecewise"
+        vllm_args: ["--compilation-config", '{"cudagraph_mode": "PIECEWISE"}']
+        metadata: {cudagraph_mode: PIECEWISE, spec: none}
+
+      - name: "full-decode-only"
+        vllm_args: ["--compilation-config", '{"cudagraph_mode": "FULL_DECODE_ONLY"}']
+        metadata: {cudagraph_mode: FULL_DECODE_ONLY, spec: none}
+
+      - name: "full"
+        vllm_args: ["--compilation-config", '{"cudagraph_mode": "FULL"}']
+        metadata: {cudagraph_mode: FULL, spec: none}
+
+      # --- speculative decoding ---------------------------------------------
+      # MTP, not a separate draft checkpoint: vLLM rewrites the architecture and
+      # drafts with the head inside this checkpoint, routed through EagleProposer.
+      # k is swept because acceptance falls off with draft depth -- the k-th token
+      # is only reached if all k-1 before it were accepted.
+      #
+      # The capture is what shows the cost side directly: a rejected draft still
+      # ran its kernels, so the draft-head work appears in the bucket table whether
+      # or not it paid off.
+      - name: "mtp-k1"
+        vllm_args: ["--speculative-config", '{"method": "mtp", "num_speculative_tokens": 1}']
+        metadata: {spec: mtp, k: 1}
+
+      - name: "mtp-k2"
+        vllm_args: ["--speculative-config", '{"method": "mtp", "num_speculative_tokens": 2}']
+        metadata: {spec: mtp, k: 2}
+
+      - name: "mtp-k3"
+        vllm_args: ["--speculative-config", '{"method": "mtp", "num_speculative_tokens": 3}']
+        metadata: {spec: mtp, k: 3}
+
+      # --- no graphs ---------------------------------------------------------
+      # The floor, and the reference for how much of the win is graph capture.
+      # One NVTX repetition of this arm is where the layer/op table comes from:
+      # under graphs there are no launches to attribute.
+      - name: "eager"
+        vllm_args: ["--enforce-eager"]
+        capture: {arms: ["cupti", "nvtx"]}
+        metadata: {cudagraph_mode: NONE, spec: none}

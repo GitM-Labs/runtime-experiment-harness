@@ -32,14 +32,23 @@ def format_version(version: tuple[int, int]) -> str:
     return ".".join(str(part) for part in version)
 
 
-def run_command(command, capture_output=False, check=True, env=None):
-    console.log(f"[blue]Running command:[/blue] {command}")
+def run_command(command, capture_output=False, check=True, env=None, cwd=None):
+    """Run a command given either as a shell-style string or as an argv list.
+
+    The list form exists for arguments the harness builds from user input --
+    clone destinations, extras, constraint paths. Those can contain spaces, and
+    round-tripping them through a string would hand shlex the job of guessing
+    where one argument ends and the next begins.
+    """
+    argv = shlex.split(command) if isinstance(command, str) else [str(part) for part in command]
+    console.log(f"[blue]Running command:[/blue] {shlex.join(argv)}")
     process = subprocess.run(
-        shlex.split(command),
+        argv,
         capture_output=capture_output,
         text=True,
         check=check,
         env=env,
+        cwd=str(cwd) if cwd is not None else None,
     )
     return process.stdout if capture_output else None
 

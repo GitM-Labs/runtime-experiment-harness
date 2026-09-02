@@ -20,10 +20,171 @@ subprocesses, so install the `gpu` extra on the cluster (or let `rex run
 ## Usage
 
 ```bash
+rex install                     # clone the Git.M runtime and install its deps
 rex init                        # write a starter experiments.yaml
 rex check                       # verify the host and provision it
 rex run                         # provision, then run every experiment
+rex analyze <capture-dir>       # read a capture back: kernels, layers, phases
+rex compare <capture-dirs>      # throughput per tracing arm
 ```
+
+`rex install` clones <https://github.com/GitM-Labs/runtime.git> into `./runtime`
+and pip-installs it into the interpreter running the harness, so the `gitm` CLI
+is importable from the same environment. It uses the repository's
+`constraints.txt` pins, and installs an editable checkout so a `git pull` in
+`runtime/` is picked up without reinstalling.
+
+Which extras it selects depends on the host: a box with `nvidia-smi` on PATH
+gets `gpu,vllm,bench` (RAPIDS, CUPTI/NVML, and the vLLM decode workload, with
+NVIDIA's package index added since cuDF and CuPy are not on PyPI); anywhere else
+gets `bench`, because the GPU wheels are Linux/CUDA-only and would fail to
+resolve. Override with `--extras`.
+
+```bash
+rex install --dest /workspace/runtime     # clone somewhere other than ./runtime
+rex install --ref main                    # pin a branch, tag, or commit
+rex install --extras gpu,vllm,dev         # choose extras explicitly
+rex install --extras ""                   # base dependencies only
+rex install --no-constraints              # ignore the repo's version pins
+rex install --no-editable                 # install a copy, not a live checkout
+rex install --no-update                   # reuse an existing checkout as-is
+```
+
+On a CUDA host it then runs `gitm install` (driver-matched CUPTI, pinned
+vLLM/torch, and the tracer shim every capture depends on — without it `gitm
+capture serve` fails preflight at the injection-lib check). Off a CUDA host that
+step is skipped; `--no-gitm-install` skips it anywhere, and `--gitm-install-args`
+forwards flags such as `--skip-apt`.
+
+Re-running `rex install` fetches the latest commit into an existing checkout
+rather than re-cloning. It never deletes the destination: a directory holding
+something else — or a checkout of a different repository — is reported as an
+error so you can pick a different `--dest`.
+
+Set `HF_TOKEN` before running anything against a gated checkpoint. The harness
+warns when it is missing, because the failure otherwise lands minutes into the
+run, during weight download, well after preflight has passed:
+
+```bash
+export HF_TOKEN=hf_...
+```
+
+## Kernel captures
+
+An experiment with a `capture:` block is driven by `gitm capture serve` instead
+of guidellm. The two are exclusive by construction: the CUDA driver reads
+`CUDA_INJECTION64_PATH` exactly once, at CUDA init, so a server this harness
+started itself can never be traced afterwards. gitm owns the server for a
+capture; the harness owns the sweep around it.
+
+```bash
+rex init experiments-capture.yaml --template capture
+rex run --config experiments-capture.yaml
+```
+
+```yaml
+experiments:
+  - name: qwen-eager
+    model: Qwen/Qwen3.6-35B-A3B
+    vllm_args: ["--trust-remote-code", "--max-model-len", "16384", "--enforce-eager"]
+    capture:
+      requests: 64
+      concurrency: 8
+      input_tokens: 512
+      output_tokens: 512
+      warmup: 8
+      arms: ["cupti"]      # off | cupti | nvtx
+      repeat: 1
+```
+
+Each `(arm, repetition)` gets its own directory under
+`experiments/<experiment-id>/`, holding what gitm writes (`trace.jsonl`,
+`kernel_breakdown.json`, `serving_summary.json`, `server.log`, `preflight.json`)
+plus a `harness_record.json` saying which arm and which sweep it belongs to.
+
+### The three arms
+
+|arm    |collector                                    |answers                          |
+|-------|---------------------------------------------|---------------------------------|
+|`off`  |none — the injection variables are *cleared*  |the untraced baseline            |
+|`cupti`|kernels, memcpy, sync                         |what ran, by taxonomy bucket     |
+|`nvtx` |`cupti` + the correlation chain and vLLM ranges|which layer and which op it was |
+
+Only the `nvtx` arm can attribute a kernel to a layer: every other arm's kernels
+come back with `range_op: null`, because an anonymous `nvjet` GEMM is not
+identifiable from its name. Never put `--enable-layerwise-nvtx-tracing` in
+`vllm_args` — gitm's `--nvtx` adds it to exactly the arm that collects the
+ranges. Setting it by hand pushes ranges in every arm, including the ones whose
+throughput is supposed to be range-free, and the cost lands in the comparison
+without appearing anywhere in the configuration. The same goes for
+`GITM_TRACE_NVTX` and `NVTX_INJECTION64_PATH`: `--nvtx` sets both.
+
+### What `rex run` prints per capture
+
+* **kernel buckets** — time by taxonomy bucket, from `kernel_breakdown.json`.
+* **layer / op tables** — `nvtx` arms only, streamed from the merged trace.
+  Ops outside the decoder stack (`logits_processor`, `embed_tokens`) have no
+  layer, so they appear in the op table and not the layer table.
+* **prefill vs decode** — gitm's phase classifier, reported with its attribution
+  stats. Trust it only as far as those go: most kernels are byte-identical in
+  both phases and inherit the phase of the nearest kernel that names one. A
+  median gap of microseconds means the neighbour is in the same engine step;
+  milliseconds means the inference crossed a step boundary, and under chunked
+  prefill a single step genuinely mixes both phases.
+
+`rex analyze <dir>` reprints all of it from an existing capture directory — no
+GPU, no server, and it accepts either the capture directories themselves or a
+parent holding them.
+
+## Tracing overhead
+
+```bash
+rex init experiments-overhead.yaml --template overhead
+rex run --config experiments-overhead.yaml
+rex compare experiments/tracer-overhead-gpu1
+```
+
+Three arms, one server command, one client workload, one seed — the only
+difference is the state of the collector. Repetitions interleave the arms
+(`off, cupti, nvtx, off, ...`) rather than running three of each in a row, so
+anything that drifts over the session doesn't land entirely on one arm.
+
+The table is grouped on the tracing state each run *reported* in
+`serving_summary.json`, not on the arm the harness asked for. Those disagree
+exactly when the measurement is worthless — an injection variable inherited from
+the shell attaches the collector to the arm whose purpose is not to have one —
+and `rex run` flags the mismatch per run rather than averaging it in.
+
+Throughput comes from vLLM's own `/metrics`, differenced across the window.
+There is no client-side tokens/s to read: the client block reports latency
+percentiles and goodput but carries no token counts, so a run whose scrape
+failed reports no throughput rather than a zero that would read as catastrophic
+overhead.
+
+## CUDA graphs and speculative decoding
+
+Two manifests over the same eight arms — four `cudagraph_mode` settings, three
+MTP draft depths, and eager as the floor:
+
+```bash
+rex init sweep.yaml --template cudagraph-spec          # guidellm: how fast it serves
+rex init sweep.yaml --template cudagraph-spec-capture  # gitm: what it actually ran
+```
+
+Check the resolved mode before comparing anything. vLLM *resolves*
+`cudagraph_mode` and may downgrade it — a hybrid model with linear-attention
+layers constrains `PIECEWISE` — so an arm can ask for one mode and run another
+without failing:
+
+```bash
+grep -h "cudagraph_mode" experiments/*/*/server.log
+```
+
+Two arms that silently resolved to the same mode differ only by noise, and that
+reads as "the mode does not matter". Under graphs, expect `gpu_active_share` to
+fall without the GPU doing less: replayed graph work is not a launch, so it is
+not attributed. That is why the graph arms are read against serving throughput
+and the eager arm carries the layer attribution.
 
 `rex check` prepares the box in five steps and stops at the first failure:
 

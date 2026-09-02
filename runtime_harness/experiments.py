@@ -9,8 +9,10 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,7 +26,16 @@ import yaml
 from rich.console import Console
 
 from . import __version__
+from .analysis import analyze_capture, overhead_rows, print_capture_analysis, render_overhead
 from .banner import harness_banner
+from .capture import (
+    ARM_TRACING,
+    CaptureSpec,
+    capture_spec_from_raw,
+    check_keep_server,
+    run_capture,
+    warn_if_no_hf_token,
+)
 from .checks import DEFAULT_EXPERIMENTS_DIR, run_preflight
 
 console = Console()
@@ -32,7 +43,30 @@ console = Console()
 # Config and outputs resolve against the invocation directory, never the install
 # location -- site-packages is often read-only and is never the user's workspace.
 DEFAULT_CONFIG_NAME = "experiments.yaml"
-BUNDLED_CONFIG = Path(__file__).parent / "data" / DEFAULT_CONFIG_NAME
+DATA_DIR = Path(__file__).parent / "data"
+BUNDLED_CONFIG = DATA_DIR / DEFAULT_CONFIG_NAME
+
+# Starter manifests shipped in the wheel, written out by `rex init --template`.
+# One copy each, here -- a second copy in the repo root would drift, and a sweep
+# whose arms differ in more than the thing under test measures nothing.
+TEMPLATES = {
+    # guidellm: end-to-end serving throughput.
+    "serving": BUNDLED_CONFIG,
+    "cudagraph-spec": DATA_DIR / "cudagraph-spec.yaml",
+    # gitm capture: kernels, NVTX layer/op attribution, prefill vs decode.
+    "capture": DATA_DIR / "capture.yaml",
+    "overhead": DATA_DIR / "overhead.yaml",
+    "cudagraph-spec-capture": DATA_DIR / "cudagraph-spec-capture.yaml",
+}
+
+
+def template_path(name: str) -> Path:
+    try:
+        return TEMPLATES[name]
+    except KeyError:
+        raise ValueError(
+            f"Unknown template {name!r}. Available: {', '.join(sorted(TEMPLATES))}."
+        ) from None
 
 
 def utc_timestamp() -> str:
@@ -102,6 +136,11 @@ class Experiment:
     guidellm_args: list[str] = dataclasses.field(default_factory=list)
     guidellm_command: list[str] = dataclasses.field(default_factory=list)
     metadata: dict = dataclasses.field(default_factory=dict)
+    # Present when the entry is driven by `gitm capture serve` instead of by
+    # guidellm. The two are exclusive: gitm owns the server for a capture, because
+    # the CUDA driver reads CUDA_INJECTION64_PATH once at CUDA init and a server
+    # this harness started itself can never be traced afterwards.
+    capture: CaptureSpec | None = None
 
 
 def normalize_arg_list(raw):
@@ -114,6 +153,79 @@ def normalize_arg_list(raw):
     raise ValueError("Argument lists must be strings or lists.")
 
 
+def retarget_output_path(command: list[str], suffix: str) -> list[str]:
+    """Give one variant its own guidellm report path.
+
+    The path is baked into a ``--output kind=json,path=...`` argument. Left alone,
+    every arm of a sweep writes the same file and the last one wins silently -- the
+    run directory still looks complete, and the JSON in it describes whichever arm
+    happened to finish last.
+    """
+    out = []
+    for arg in command:
+        match = re.search(r"(kind=json,\s*path=)([^,\s]+)", arg)
+        if match:
+            path = Path(match.group(2))
+            renamed = path.with_name(f"{path.stem}-{suffix}{path.suffix}")
+            arg = arg[: match.start(2)] + str(renamed) + arg[match.end(2) :]
+        out.append(arg)
+    return out
+
+
+def expand_variants(raw: dict) -> list[dict]:
+    """Expand one entry carrying ``variants:`` into one entry per variant.
+
+    A sweep over cudagraph modes or speculative settings is the same experiment
+    with a few flags changed. Writing those out by hand means N near-identical
+    blocks that drift apart on the fields nobody meant to vary -- and a sweep whose
+    arms differ in more than the one thing under test measures nothing.
+
+    Each variant contributes a name suffix and its own ``vllm_args``, appended
+    AFTER the base list so a variant can override a base flag (vLLM's parser takes
+    the last occurrence). Its guidellm report is retargeted so arms do not
+    overwrite each other.
+    """
+    variants = raw.get("variants")
+    if not variants:
+        return [raw]
+
+    expanded = []
+    for variant in variants:
+        if "name" not in variant:
+            raise ValueError(f"Every variant of {raw.get('name')!r} needs a name.")
+        suffix = str(variant["name"])
+        entry = {key: value for key, value in raw.items() if key != "variants"}
+        entry["name"] = f"{raw['name']}-{suffix}"
+        entry["vllm_args"] = normalize_arg_list(raw.get("vllm_args")) + normalize_arg_list(
+            variant.get("vllm_args")
+        )
+        entry["guidellm_command"] = retarget_output_path(
+            normalize_arg_list(raw.get("guidellm_command")), suffix
+        )
+        # A variant may override individual capture settings (a longer window for
+        # the slow arm, say) without restating the whole block -- and without the
+        # load shape silently differing between arms, which is the one thing a
+        # sweep cannot survive.
+        base_capture = raw.get("capture")
+        variant_capture = variant.get("capture")
+        if isinstance(base_capture, dict) or isinstance(variant_capture, dict):
+            entry["capture"] = {
+                **(base_capture if isinstance(base_capture, dict) else {}),
+                **(variant_capture if isinstance(variant_capture, dict) else {}),
+            }
+        elif variant_capture is not None:
+            entry["capture"] = variant_capture
+        # Record what actually varied, so a result can be read back to its arm
+        # without re-deriving it from the flag list.
+        entry["metadata"] = {
+            **raw.get("metadata", {}),
+            **variant.get("metadata", {}),
+            "variant": suffix,
+        }
+        expanded.append(entry)
+    return expanded
+
+
 def load_experiments(config_path: Path):
     with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
@@ -123,11 +235,21 @@ def load_experiments(config_path: Path):
 
     gpu_counts = config.get("gpu_counts", [2, 4, 8])
     experiments = []
-    for raw in config.get("experiments", []):
+    raw_entries = [
+        expanded
+        for entry in config.get("experiments", [])
+        for expanded in expand_variants(entry)
+    ]
+    for raw in raw_entries:
+        capture_spec = capture_spec_from_raw(raw.get("capture"))
+        # guidellm needs a prompt; gitm builds its own synthetic ones from
+        # --input-tokens, so requiring one there would be a field nobody reads.
+        if capture_spec is None and "prompt" not in raw:
+            raise ValueError(f"Experiment {raw.get('name')!r} needs a prompt (or a capture block).")
         experiment = Experiment(
             name=raw["name"],
             model=raw["model"],
-            prompt=raw["prompt"],
+            prompt=raw.get("prompt", ""),
             batch_size=int(raw.get("batch_size", 1)),
             sequence_length=int(raw.get("sequence_length", 512)),
             num_steps=int(raw.get("num_steps", 10)),
@@ -139,6 +261,7 @@ def load_experiments(config_path: Path):
             guidellm_args=normalize_arg_list(raw.get("guidellm_args")),
             guidellm_command=normalize_arg_list(raw.get("guidellm_command")),
             metadata=raw.get("metadata", {}),
+            capture=capture_spec,
         )
         experiments.append(experiment)
 
@@ -204,6 +327,104 @@ def build_guidellm_command(experiment: Experiment):
     return command
 
 
+def gpu_memory_used_mib():
+    """VRAM in use across all visible GPUs, or None if nvidia-smi cannot answer."""
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    total = 0
+    for line in proc.stdout.split():
+        try:
+            total += int(line.strip())
+        except ValueError:
+            return None
+    return total
+
+
+def stop_vllm_server(process, *, idle_mib: int = 2048, settle_timeout: float = 180.0):
+    """Kill the server's whole process GROUP, then wait for its VRAM to come back.
+
+    vLLM V1 is a process tree -- the API server, EngineCore, and one worker per TP
+    rank -- and EngineCore is the one holding the KV cache, which at
+    --gpu-memory-utilization 0.95 is ~133 GiB on an H200. ``process.terminate()``
+    and ``process.kill()`` signal only the direct child, so EngineCore survives.
+    SIGKILL is worse than SIGTERM here rather than better: it denies the parent any
+    chance to reap its own children, which makes the orphan more likely, not less.
+
+    The orphan does not hold the port. So the next experiment's /health poll passes,
+    any port check passes, and it fails instead inside engine startup with
+    "Engine core initialization failed ... Failed core proc(s): {}" -- a message that
+    mentions neither memory nor the previous run. Unattended, every arm after the
+    first fails that way and is recorded as success=False, leaving a results file
+    that looks complete and holds one real measurement.
+
+    Hence both halves: signal the group (start_new_session in start_vllm_server puts
+    the tree in its own group), and then verify the memory actually came back rather
+    than assuming a fixed sleep was long enough. Freeing lags process exit.
+    """
+    if process is None or process.poll() is not None:
+        return
+    try:
+        pgid = os.getpgid(process.pid)
+    except (OSError, AttributeError):
+        pgid = None
+
+    for sig, grace in ((signal.SIGINT, 20.0), (signal.SIGTERM, 15.0), (signal.SIGKILL, 5.0)):
+        if process.poll() is not None:
+            break
+        try:
+            if pgid is not None:
+                os.killpg(pgid, sig)
+            else:  # no process group -- the direct child is all we can reach
+                process.send_signal(sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            break
+        try:
+            process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            continue
+
+    wait_for_idle_vram(idle_mib=idle_mib, settle_timeout=settle_timeout)
+
+
+def wait_for_idle_vram(idle_mib: int = 2048, settle_timeout: float = 180.0) -> bool:
+    """Block until VRAM is back below ``idle_mib``, or report that it never was.
+
+    Freeing lags process exit, so "the server exited" is not "the memory is back".
+    Used after every experiment -- including the captures, where gitm owns the
+    shutdown -- because the failure this prevents does not look like a memory
+    failure: the next run's /health poll passes against nothing, and it dies inside
+    engine startup with a message naming neither memory nor the previous run.
+    """
+    if gpu_memory_used_mib() is None:
+        console.log("[yellow]nvidia-smi unavailable; not verifying VRAM was released[/yellow]")
+        return True
+
+    deadline = time.monotonic() + settle_timeout
+    while time.monotonic() < deadline:
+        used = gpu_memory_used_mib()
+        if used is None or used <= idle_mib:
+            console.log(f"[green]VRAM released ({used} MiB in use)[/green]")
+            return True
+        time.sleep(3.0)
+
+    console.log(
+        f"[red]VRAM still held ({gpu_memory_used_mib()} MiB) after {settle_timeout:.0f}s. "
+        f"A process outside this group is holding it; the next experiment will fail "
+        f"inside engine startup. Check: nvidia-smi --query-compute-apps=pid,used_memory "
+        f"--format=csv[/red]"
+    )
+    return False
+
+
 async def start_vllm_server(experiment: Experiment, gpu_count: int, startup_timeout: float = 900.0):
     """Launch vLLM with the manifest's parameters and wait until it serves traffic.
 
@@ -224,6 +445,10 @@ async def start_vllm_server(experiment: Experiment, gpu_count: int, startup_time
         stderr=subprocess.PIPE,
         text=True,
         env=env,
+        # Own process group, so stop_vllm_server can signal the whole tree.
+        # Without it only the API server is reachable and EngineCore is orphaned
+        # still holding the KV cache.
+        start_new_session=True,
     )
 
     def failure(stderr: str):
@@ -300,6 +525,87 @@ def run_guidellm(experiment: Experiment, reports_dir=None, exp_id=None, timestam
         "stderr": process.stderr,
         "guidellm_output_path": report_path,
     }
+
+
+def capture_run_label(spec: CaptureSpec, arm: str, repetition: int) -> str:
+    """Directory suffix for one (arm, repetition).
+
+    The repetition index is in the name only when there is more than one, so a
+    single-arm capture reads as `..._cupti` rather than `..._cupti-r1`.
+    """
+    return arm if spec.repeat == 1 else f"{arm}-r{repetition}"
+
+
+def run_capture_experiment(experiment: Experiment, gpu_count: int, experiments_dir, timestamp=None):
+    """Run every (arm, repetition) of one capture experiment and analyze each.
+
+    One directory per run, all under experiments/<exp-id>/, so the arms of a
+    comparison sit side by side and none of them can overwrite another's trace.
+    """
+    spec = experiment.capture
+    exp_id = experiment_id(experiment, gpu_count)
+    timestamp = timestamp or utc_timestamp()
+    experiments_dir = Path(experiments_dir)
+
+    records = []
+    for arm, repetition in spec.runs():
+        label = capture_run_label(spec, arm, repetition)
+        out_dir = experiments_dir / exp_id / f"{timestamp}_{exp_id}_{label}"
+        record = run_capture(
+            spec,
+            arm,
+            out_dir,
+            experiment.model,
+            experiment.vllm_args,
+            gpu_count=gpu_count,
+        )
+        record.update(
+            {
+                "name": exp_id,
+                "experiment": experiment.name,
+                "gpu_count": gpu_count,
+                "repetition": repetition,
+                "timestamp": timestamp,
+                "metadata": experiment.metadata,
+            }
+        )
+
+        if spec.analyze and record["status"] != "skipped":
+            analysis = analyze_capture(out_dir, layerwise=(arm == "nvtx"))
+            record["analysis"] = analysis
+            record["serving"] = analysis.get("serving")
+            print_capture_analysis(analysis)
+            verify_arm(record, arm)
+
+        # gitm shuts the server down itself, but freeing lags exit and the next arm
+        # starts immediately.
+        if not spec.keep_server:
+            wait_for_idle_vram()
+
+        with (out_dir / "harness_record.json").open("w", encoding="utf-8") as handle:
+            json.dump(record, handle, indent=2)
+        records.append(record)
+
+    return records
+
+
+def verify_arm(record: dict, arm: str):
+    """Check the run reported the tracing state the arm asked for.
+
+    gitm writes what it actually did into serving_summary.json. An arm that asked
+    for no collector and reports one -- an injection variable inherited from the
+    shell -- still produces a throughput number, and that number reads as "tracing
+    is free" rather than as a broken baseline.
+    """
+    expected = ARM_TRACING.get(arm)
+    reported = ((record.get("serving") or {}) or {}).get("tracing")
+    if expected and reported and reported != expected:
+        console.log(
+            f"[red]{record['name']} ran as arm {arm!r} (expecting tracing={expected!r}) "
+            f"but the run reports tracing={reported!r}. Do not compare this run: the "
+            f"collector was not in the state the arm claims.[/red]"
+        )
+        record["arm_mismatch"] = {"expected": expected, "reported": reported}
 
 
 def parse_latency_from_output(output: str):
@@ -380,10 +686,28 @@ async def run_all_experiments(
     if not desired_gpu_counts:
         raise ValueError(f"No supported GPU counts found for this machine. Detected {gpu_count}.")
 
+    # Checked across the whole manifest, before anything launches: a kept server
+    # holds the port and the KV cache, so it is only ever valid as the last run.
+    total_capture_runs = sum(
+        len(exp.capture.runs()) * len(desired_gpu_counts)
+        for exp in experiments
+        if exp.capture is not None
+    )
+    for exp in experiments:
+        if exp.capture is not None:
+            check_keep_server(exp.capture, total_capture_runs)
+    if any(exp.capture is not None for exp in experiments):
+        warn_if_no_hf_token()
+
     for exp in experiments:
         for count in desired_gpu_counts:
             exp_id = experiment_id(exp, count)
             timestamp = utc_timestamp()
+
+            if exp.capture is not None:
+                results.extend(run_capture_experiment(exp, count, experiments_dir, timestamp))
+                continue
+
             vllm_result, server_process = await start_vllm_server(exp, count)
             results.append(vllm_result)
 
@@ -403,18 +727,19 @@ async def run_all_experiments(
             guidellm_result["gpu_count"] = count
             save_experiment_result(guidellm_result, experiments_dir, exp_id, timestamp)
 
-            if server_process is not None and server_process.poll() is None:
-                server_process.terminate()
-                try:
-                    server_process.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    server_process.kill()
+            stop_vllm_server(server_process)
 
             task = asyncio.create_task(plot_results_async(results.copy(), output_dir / "plots"))
             pending_plots.append(task)
 
     if pending_plots:
         await asyncio.gather(*pending_plots)
+
+    # More than one tracing arm in the results means an overhead comparison was
+    # the point of the sweep; print it rather than leaving it in the JSON.
+    capture_records = [r for r in results if r.get("engine") == "gitm-capture"]
+    if len({(r.get("serving") or {}).get("tracing") or r.get("arm") for r in capture_records}) > 1:
+        console.print(render_overhead(overhead_rows(capture_records)))
 
     output_json = output_dir / "experiment_results.json"
     output_json.parent.mkdir(parents=True, exist_ok=True)
