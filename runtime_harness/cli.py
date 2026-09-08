@@ -74,7 +74,7 @@ def cmd_install(args) -> int:
 
 
 def cmd_run(args) -> int:
-    asyncio.run(
+    results = asyncio.run(
         run_all_experiments(
             args.config,
             install=not args.no_install,
@@ -84,6 +84,20 @@ def cmd_run(args) -> int:
             reports_dir=args.reports_dir,
         )
     )
+    # A sweep keeps going past a failed experiment (the rest of the matrix is
+    # still worth having), but the process must not report success for it —
+    # a k8s Job that shows Succeeded on a dead server is invisible breakage.
+    # Skipped rows (e.g. NVIDIA-only capture on ROCm) are not failures.
+    failed = [
+        r["name"] for r in results
+        if not r.get("success") and r.get("status") != "skipped"
+    ]
+    if failed:
+        console.print(
+            f"[bold red]{len(failed)} experiment step(s) failed:[/bold red] "
+            + ", ".join(dict.fromkeys(failed))
+        )
+        return 1
     return 0
 
 

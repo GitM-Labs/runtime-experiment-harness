@@ -276,8 +276,19 @@ def load_experiments(config_path: Path):
     return gpu_counts, experiments
 
 
+
+
+def vllm_launcher() -> list[str]:
+    """`python -m vllm` fails (no __main__); prefer the console script, then the
+    CLI module it points at."""
+    vllm_bin = shutil.which("vllm")
+    if vllm_bin:
+        return [vllm_bin]
+    return [sys.executable, "-m", "vllm.entrypoints.cli.main"]
+
+
 def build_vllm_command(experiment: Experiment, gpu_count: int):
-    command = [sys.executable, "-m", "vllm", "serve", experiment.model]
+    command = vllm_launcher() + ["serve", experiment.model]
 
     if experiment.tp and not any(arg.startswith("--tensor-parallel-size") for arg in experiment.vllm_args):
         command += ["--tensor-parallel-size", str(experiment.tp)]
@@ -309,14 +320,19 @@ def server_is_ready(port: int, timeout: float = 2.0) -> bool:
         return False
 
 
+def guidellm_launcher() -> list[str]:
+    guidellm_bin = shutil.which("guidellm")
+    if guidellm_bin:
+        return [guidellm_bin]
+    return [sys.executable, "-m", "guidellm"]
+
+
 def build_guidellm_command(experiment: Experiment):
     if experiment.guidellm_command:
-        return [sys.executable, "-m", "guidellm"] + experiment.guidellm_command
+        return guidellm_launcher() + experiment.guidellm_command
 
     command = [
-        sys.executable,
-        "-m",
-        "guidellm",
+        *guidellm_launcher(),
         "run",
         "--name",
         experiment.name,

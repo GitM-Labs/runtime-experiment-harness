@@ -1,4 +1,5 @@
 import asyncio
+import sys
 
 import pytest
 
@@ -33,7 +34,14 @@ def test_vllm_command_reads_manifest_parameters():
     exp = make_experiment(ep=2, vllm_args=["--gpu-memory-utilization", "0.95"])
     command = build_vllm_command(exp, 2)
 
-    assert command[1:4] == ["-m", "vllm", "serve"]
+    # Launcher is the `vllm` console script when on PATH, else
+    # `python -m vllm.entrypoints.cli.main` — never `-m vllm` (no __main__).
+    serve_at = command.index("serve")
+    launcher = command[:serve_at]
+    assert launcher in ([sys.executable, "-m", "vllm.entrypoints.cli.main"],) or (
+        len(launcher) == 1 and launcher[0].endswith("vllm")
+    )
+    assert "-m vllm serve" not in " ".join(command)
     assert exp.model in command
     assert "--tensor-parallel-size" in command and "2" in command
     assert "--enable-expert-parallel" in command
