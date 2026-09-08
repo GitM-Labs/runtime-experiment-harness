@@ -3,7 +3,6 @@
 # Power-cap arm: run the `powercap` variant only after
 #   amd-smi set --power-cap <watts>     (record the value; restore after)
 # No --pmc anywhere: counters serialize kernels (offline Tier-2 only).
-# VERIFY-MODEL-ID: deepseek-ai/DeepSeek-V4-Pro was not confirmed against HF before generation.
 # Check it (and the guidellm backend model= below) before launching.
 gpu_counts:
 - 8

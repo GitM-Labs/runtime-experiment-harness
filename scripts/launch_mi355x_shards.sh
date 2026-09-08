@@ -4,6 +4,8 @@
 #
 #   scripts/launch_mi355x_shards.sh                # stage + launch everything
 #   scripts/launch_mi355x_shards.sh kimi-k25       # just one shard's jobs
+#   scripts/launch_mi355x_shards.sh qwen-36-35b 1  # one shard, override node count
+#                                                  # (smoke-test a single Job first)
 #
 # Node budget (per the run plan): kimi-k25 gets 4 nodes, every other model 2.
 # A "node" here is one 8-GPU Job; the scheduler places them. Multiple indexes
@@ -20,12 +22,16 @@ cd "$(dirname "$0")/.."
 REX_DIR="${REX_DIR:-/mnt/shared/rex}"
 STAGE_POD="${STAGE_POD:-rex-stage}"
 ONLY_SHARD="${1:-}"
+# Optional second arg: node count for that shard (requires ONLY_SHARD).
+COUNT_OVERRIDE="${2:-}"
+if [[ -n "${COUNT_OVERRIDE}" && -z "${ONLY_SHARD}" ]]; then
+  echo "a count override needs a shard name first" >&2; exit 1
+fi
 
 # shard -> parallel node count
 declare -A BUDGET=(
   [kimi-k25]=4
   [kimi-k3]=2
-  [kimi-k27]=2
   [deepseek-v4-flash]=2
   [deepseek-v4-pro]=2
   [glm-52]=2
@@ -72,7 +78,7 @@ for shard in "${!BUDGET[@]}"; do
   if [[ -n "${ONLY_SHARD}" && "${shard}" != "${ONLY_SHARD}" ]]; then
     continue
   fi
-  for index in $(seq 1 "${BUDGET[${shard}]}"); do
+  for index in $(seq 1 "${COUNT_OVERRIDE:-${BUDGET[${shard}]}}"); do
     sed -e "s|__SHARD__|${shard}|g" \
         -e "s|__INDEX__|${index}|g" \
         -e "s|__REX_DIR__|${REX_DIR}|g" \
