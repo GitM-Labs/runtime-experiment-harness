@@ -27,6 +27,11 @@ DEFAULT_REPORTS_DIR = Path("/workspace/guidellm_reports")
 # exact torch build, and installing torch first would just get it replaced.
 RUNTIME_PACKAGES = ["torch", "vllm", "guidellm", "huggingface-hub", "plotly"]
 
+# On ROCm the vLLM image ships matched torch/vllm ROCm builds; pip would
+# replace them with CUDA wheels that cannot import. Install only the pieces
+# the image does not carry.
+ROCM_RUNTIME_PACKAGES = ["guidellm", "huggingface-hub", "plotly"]
+
 
 def format_version(version: tuple[int, int]) -> str:
     return ".".join(str(part) for part in version)
@@ -154,24 +159,48 @@ def parse_gpu_topology():
 def run_preflight(install=True, hf_home=None, experiments_dir=None, reports_dir=None):
     """Verify the host and provision it for experiments.
 
+    NVIDIA path (unchanged):
     1. CUDA >= 13.0 (vLLM dropped everything older)
     2. GPU count and NVLink topology matrix
     3. torch / vllm / guidellm / huggingface-hub installed
-    4. HF cache, experiments, and guidellm report directories created
-    5. HF_HOME pointed at the cache
 
-    Raises on the first unmet requirement.
+    ROCm path (MI355X/MI300X): the CUDA gate is bypassed — ROCm version and
+    the xGMI topology are recorded instead — and torch/vllm are NOT installed:
+    the vLLM ROCm image ships matched builds, and PyPI would replace them with
+    CUDA wheels. Result shape is identical, so everything downstream (including
+    the results schema the H200 rows use) is untouched.
+
+    Both paths then create the HF cache / experiments / reports directories and
+    point HF_HOME at the cache. Raises on the first unmet requirement.
     """
-    ensure_cuda_supported()
+    from . import rocm
 
-    gpu_count, nvlink_available, topo_raw = parse_gpu_topology()
-    console.print(f"[bold]Detected GPUs:[/bold] {gpu_count}")
-    console.print(f"[bold]NVLink available:[/bold] {nvlink_available}")
-    console.print("[bold]Topology matrix:[/bold]\n" + topo_raw)
+    if rocm.is_rocm():
+        version = rocm.rocm_version()
+        console.print(f"[bold]ROCm version:[/bold] {version or 'unknown'}")
+        gpu_count, link_available, topo_raw = rocm.parse_gpu_topology()
+        if gpu_count == 0:
+            raise RuntimeError(
+                "ROCm host detected but no GPUs visible in the kfd topology. "
+                "Check the container has /dev/kfd and /dev/dri (device plugin / --device flags)."
+            )
+        console.print(f"[bold]Detected GPUs:[/bold] {gpu_count}")
+        console.print(f"[bold]xGMI available:[/bold] {link_available}")
+        if topo_raw.strip():
+            console.print("[bold]Topology matrix:[/bold]\n" + topo_raw)
+        if install:
+            ensure_dependencies(ROCM_RUNTIME_PACKAGES)
+    else:
+        ensure_cuda_supported()
 
-    if install:
-        ensure_dependencies()
+        gpu_count, link_available, topo_raw = parse_gpu_topology()
+        console.print(f"[bold]Detected GPUs:[/bold] {gpu_count}")
+        console.print(f"[bold]NVLink available:[/bold] {link_available}")
+        console.print("[bold]Topology matrix:[/bold]\n" + topo_raw)
+
+        if install:
+            ensure_dependencies()
 
     hf_home, experiments_dir, reports_dir = prepare_workspace(hf_home, experiments_dir, reports_dir)
 
-    return gpu_count, nvlink_available, topo_raw, hf_home, experiments_dir, reports_dir
+    return gpu_count, link_available, topo_raw, hf_home, experiments_dir, reports_dir
