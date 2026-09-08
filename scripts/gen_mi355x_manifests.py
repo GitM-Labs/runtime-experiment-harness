@@ -45,8 +45,6 @@ MODELS = [
      ["--tool-call-parser", "kimi_k2", "--enable-auto-tool-choice", "--reasoning-parser", "kimi_k2"], 4),
     ("kimi-k3", "moonshotai/Kimi-K3", True,
      ["--tool-call-parser", "kimi_k2", "--enable-auto-tool-choice", "--reasoning-parser", "kimi_k2"], 2),
-    ("kimi-k27", "moonshotai/Kimi-K2.7", True,
-     ["--tool-call-parser", "kimi_k2", "--enable-auto-tool-choice", "--reasoning-parser", "kimi_k2"], 2),
     ("deepseek-v4-flash", "deepseek-ai/DeepSeek-V4-Flash", True, [], 2),
     ("deepseek-v4-pro", "deepseek-ai/DeepSeek-V4-Pro", True, [], 2),
     ("glm-52", "zai-org/GLM-5.2", True, [], 2),
