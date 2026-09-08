@@ -28,19 +28,23 @@ if [[ -n "${COUNT_OVERRIDE}" && -z "${ONLY_SHARD}" ]]; then
   echo "a count override needs a shard name first" >&2; exit 1
 fi
 
-# shard -> parallel node count
-declare -A BUDGET=(
-  [kimi-k25]=4
-  [kimi-k3]=2
-  [deepseek-v4-flash]=2
-  [deepseek-v4-pro]=2
-  [glm-52]=2
-  [qwen-36-35b]=2
+# shard -> parallel node count ("shard=count", plain array: macOS ships bash 3.2,
+# which has no associative arrays)
+BUDGET=(
+  kimi-k25=4
+  kimi-k3=2
+  deepseek-v4-flash=2
+  deepseek-v4-pro=2
+  glm-52=2
+  qwen-36-35b=2
 )
 
 echo "==> building wheel"
-python3 -m pip install --quiet build
-python3 -m build --wheel --outdir dist
+# --no-isolation: the default builds a throwaway venv and pip-installs
+# hatchling into it on every run — the slow part of launching. Install the
+# build deps into the current env once and reuse them.
+python3 -m pip install --quiet build hatchling
+python3 -m build --wheel --no-isolation --outdir dist
 
 echo "==> ensuring staging pod ${STAGE_POD} (mounts /mnt/shared)"
 if ! kubectl get pod "${STAGE_POD}" >/dev/null 2>&1; then
@@ -74,11 +78,13 @@ for shard_file in experiments/mi355x/*.yaml; do
 done
 
 echo "==> launching jobs"
-for shard in "${!BUDGET[@]}"; do
+for entry in "${BUDGET[@]}"; do
+  shard="${entry%=*}"
+  count="${entry#*=}"
   if [[ -n "${ONLY_SHARD}" && "${shard}" != "${ONLY_SHARD}" ]]; then
     continue
   fi
-  for index in $(seq 1 "${COUNT_OVERRIDE:-${BUDGET[${shard}]}}"); do
+  for index in $(seq 1 "${COUNT_OVERRIDE:-${count}}"); do
     sed -e "s|__SHARD__|${shard}|g" \
         -e "s|__INDEX__|${index}|g" \
         -e "s|__REX_DIR__|${REX_DIR}|g" \
