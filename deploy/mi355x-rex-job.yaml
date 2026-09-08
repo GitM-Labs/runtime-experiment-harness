@@ -1,0 +1,76 @@
+# One rex shard on one MI355X node — a Job per (shard, node index).
+# Do not apply directly: scripts/launch_mi355x_shards.sh substitutes
+# __SHARD__ / __INDEX__ / __REX_DIR__ and applies one Job per assignment.
+#
+# Assumes /mnt/shared is the cluster-shared filesystem (it carries the HF
+# cache today). scripts/launch_mi355x_shards.sh stages into __REX_DIR__ there:
+#   wheel/   the runtime-experiment-harness wheel (built from this checkout)
+#   shards/  experiments/mi355x/*.yaml
+# Results land in __REX_DIR__/results/<shard>/ — on shared storage, so the
+# off-cluster sync (scripts/sync_results.sh) reads one place. Nothing
+# important may exist only on the cluster.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rex-__SHARD__-__INDEX__
+  labels:
+    app: rex
+    shard: "__SHARD__"
+spec:
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: rex
+        shard: "__SHARD__"
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 60
+      tolerations:
+      - key: amd.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: rex
+        image: vllm/vllm-openai-rocm:latest
+        command: ["/bin/bash", "-lc"]
+        args:
+        - |
+          set -euo pipefail
+          pip install __REX_DIR__/wheel/runtime_experiment_harness-*.whl
+          mkdir -p /workspace __REX_DIR__/results/__SHARD__
+          # The ROCm preflight installs only guidellm/huggingface-hub/plotly —
+          # it never touches the image's torch/vllm ROCm builds (see
+          # runtime_harness.checks.ROCM_RUNTIME_PACKAGES).
+          exec rex run \
+            --config __REX_DIR__/shards/__SHARD__.yaml \
+            --hf-home /mnt/shared/hf-cache \
+            --experiments-dir __REX_DIR__/results/__SHARD__/experiments \
+            --reports-dir __REX_DIR__/results/__SHARD__/reports \
+            --output-dir __REX_DIR__/results/__SHARD__
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token-secret
+              key: token
+              optional: true
+        resources:
+          requests:
+            amd.com/gpu: "8"
+          limits:
+            amd.com/gpu: "8"
+        volumeMounts:
+        - name: shared
+          mountPath: /mnt/shared
+        - name: shm
+          mountPath: /dev/shm
+        - name: workspace   # guidellm report paths in the manifests use /workspace
+          mountPath: /workspace
+      volumes:
+      - name: shared
+        hostPath: {path: /mnt/shared}
+      - name: shm
+        emptyDir: {medium: Memory, sizeLimit: 64Gi}
+      - name: workspace
+        emptyDir: {}

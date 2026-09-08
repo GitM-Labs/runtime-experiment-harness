@@ -136,6 +136,10 @@ class Experiment:
     guidellm_args: list[str] = dataclasses.field(default_factory=list)
     guidellm_command: list[str] = dataclasses.field(default_factory=list)
     metadata: dict = dataclasses.field(default_factory=dict)
+    # Extra environment for the SERVER process only (e.g. RCCL_DEBUG=INFO for
+    # the one-run-per-model algorithm/protocol log). Manifest values win over
+    # the inherited shell so an arm's env is what the manifest says it is.
+    env: dict = dataclasses.field(default_factory=dict)
     # Present when the entry is driven by `gitm capture serve` instead of by
     # guidellm. The two are exclusive: gitm owns the server for a capture, because
     # the CUDA driver reads CUDA_INJECTION64_PATH once at CUDA init and a server
@@ -215,6 +219,9 @@ def expand_variants(raw: dict) -> list[dict]:
             }
         elif variant_capture is not None:
             entry["capture"] = variant_capture
+        # A variant may add server env (RCCL_DEBUG=INFO on one arm, say)
+        # without restating the base's.
+        entry["env"] = {**(raw.get("env") or {}), **(variant.get("env") or {})}
         # Record what actually varied, so a result can be read back to its arm
         # without re-deriving it from the flag list.
         entry["metadata"] = {
@@ -261,6 +268,7 @@ def load_experiments(config_path: Path):
             guidellm_args=normalize_arg_list(raw.get("guidellm_args")),
             guidellm_command=normalize_arg_list(raw.get("guidellm_command")),
             metadata=raw.get("metadata", {}),
+            env={str(k): str(v) for k, v in (raw.get("env") or {}).items()},
             capture=capture_spec,
         )
         experiments.append(experiment)
@@ -328,7 +336,11 @@ def build_guidellm_command(experiment: Experiment):
 
 
 def gpu_memory_used_mib():
-    """VRAM in use across all visible GPUs, or None if nvidia-smi cannot answer."""
+    """VRAM in use across all visible GPUs, or None if no SMI can answer.
+
+    nvidia-smi first; on a ROCm host the same question goes to amd-smi. The
+    teardown gate this feeds is vendor-neutral: an orphan holding the KV cache
+    kills the next arm the same way on both."""
     try:
         proc = subprocess.run(
             ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
@@ -337,7 +349,9 @@ def gpu_memory_used_mib():
             timeout=15,
         )
     except (OSError, subprocess.SubprocessError):
-        return None
+        from . import rocm
+
+        return rocm.gpu_memory_used_mib() if rocm.is_rocm() else None
     if proc.returncode != 0:
         return None
     total = 0
@@ -425,24 +439,53 @@ def wait_for_idle_vram(idle_mib: int = 2048, settle_timeout: float = 180.0) -> b
     return False
 
 
-async def start_vllm_server(experiment: Experiment, gpu_count: int, startup_timeout: float = 900.0):
+async def start_vllm_server(
+    experiment: Experiment,
+    gpu_count: int,
+    startup_timeout: float = 900.0,
+    telemetry_dir: Path | None = None,
+):
     """Launch vLLM with the manifest's parameters and wait until it serves traffic.
 
     Loading a large checkpoint can take many minutes on a cold HF cache, so this
     polls /health until ready rather than assuming a fixed startup delay.
+
+    On a ROCm host, and when ``telemetry_dir`` is given, the server is launched
+    under rocprofv3 (kernel/HIP/memcpy/RCCL planes into that directory) and its
+    stderr goes to ``server.log`` there — RCCL_DEBUG output only exists on
+    stderr, and a PIPE that is read only on failure would discard it exactly on
+    the successful run it was collected for.
     """
+    from . import rocm
+
     console.rule(f"Starting vLLM server: {experiment.name} on {gpu_count} GPUs")
     command = build_vllm_command(experiment, gpu_count)
     port = vllm_port(experiment)
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(gpu_count))
+    visible = ",".join(str(i) for i in range(gpu_count))
+    # CUDA_VISIBLE_DEVICES for NVIDIA; ROCR/HIP for ROCm. Setting all three is
+    # harmless on either vendor and keeps this one code path.
+    env["CUDA_VISIBLE_DEVICES"] = visible
+    env["ROCR_VISIBLE_DEVICES"] = visible
+    env["HIP_VISIBLE_DEVICES"] = visible
+    env.update(experiment.env)
+
+    on_rocm = rocm.is_rocm()
+    server_log = None
+    if on_rocm and telemetry_dir is not None:
+        prefix = rocm.rocprofv3_prefix(Path(telemetry_dir) / "rocprof")
+        if prefix:
+            command = prefix + command
+        telemetry_dir = Path(telemetry_dir)
+        telemetry_dir.mkdir(parents=True, exist_ok=True)
+        server_log = (telemetry_dir / "server.log").open("w", encoding="utf-8")
 
     console.log(f"[blue]vLLM command:[/blue] {shlex.join(command)}")
 
     process = subprocess.Popen(
         command,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        stderr=server_log if server_log is not None else subprocess.PIPE,
         text=True,
         env=env,
         # Own process group, so stop_vllm_server can signal the whole tree.
@@ -450,6 +493,19 @@ async def start_vllm_server(experiment: Experiment, gpu_count: int, startup_time
         # still holding the KV cache.
         start_new_session=True,
     )
+    server_log_path = None
+    if server_log is not None:
+        # The child holds its own descriptor; the parent's copy would only leak.
+        server_log_path = Path(server_log.name)
+        server_log.close()
+
+    def read_stderr() -> str:
+        if server_log_path is not None:
+            try:
+                return server_log_path.read_text(encoding="utf-8", errors="replace")[-20000:]
+            except OSError:
+                return ""
+        return process.stderr.read() if process.stderr else ""
 
     def failure(stderr: str):
         return {
@@ -465,7 +521,7 @@ async def start_vllm_server(experiment: Experiment, gpu_count: int, startup_time
     deadline = asyncio.get_running_loop().time() + startup_timeout
     while True:
         if process.poll() is not None:
-            stderr = process.stderr.read() if process.stderr else ""
+            stderr = read_stderr()
             console.log(f"[red]vLLM server exited during startup for {experiment.name}[/red]")
             console.log(stderr)
             return failure(stderr)
@@ -699,35 +755,75 @@ async def run_all_experiments(
     if any(exp.capture is not None for exp in experiments):
         warn_if_no_hf_token()
 
+    from . import rocm
+
+    on_rocm = rocm.is_rocm()
+
     for exp in experiments:
         for count in desired_gpu_counts:
             exp_id = experiment_id(exp, count)
             timestamp = utc_timestamp()
 
             if exp.capture is not None:
+                if on_rocm:
+                    # The gitm capture path is the CUDA injection collector;
+                    # this window's ROCm kernel plane is rocprofv3 on the
+                    # serving runs. Skipping loudly beats failing quietly.
+                    console.log(
+                        f"[yellow]{exp.name}: capture experiments are NVIDIA-only "
+                        f"(gitm/CUPTI); skipped on this ROCm host.[/yellow]"
+                    )
+                    results.append({
+                        "name": exp_id, "engine": "gitm-capture",
+                        "success": False, "status": "skipped",
+                        "stderr": "capture is NVIDIA-only; not run on ROCm",
+                    })
+                    continue
                 results.extend(run_capture_experiment(exp, count, experiments_dir, timestamp))
                 continue
 
-            vllm_result, server_process = await start_vllm_server(exp, count)
-            results.append(vllm_result)
+            # Telemetry rides in the run's experiment directory, next to the
+            # guidellm result it belongs to. Async and cheap by construction;
+            # the serving numbers are the thing it must never perturb.
+            telemetry_dir = Path(experiments_dir) / exp_id / f"{timestamp}_{exp_id}_telemetry"
+            sampler = None
+            if on_rocm:
+                telemetry_dir.mkdir(parents=True, exist_ok=True)
+                (telemetry_dir / "nic_before.json").write_text(
+                    json.dumps(rocm.nic_counters(), indent=2), encoding="utf-8")
+                sampler = rocm.AmdSmiSampler(telemetry_dir / "amdsmi_samples.jsonl").start()
 
-            if vllm_result["success"]:
-                guidellm_result = run_guidellm(exp, reports_dir, exp_id, timestamp)
-                results.append(guidellm_result)
-            else:
-                guidellm_result = {
-                    "name": exp.name,
-                    "engine": "guidellm",
-                    "success": False,
-                    "stdout": "",
-                    "stderr": "vLLM server failed to start.",
-                }
-                results.append(guidellm_result)
+            try:
+                vllm_result, server_process = await start_vllm_server(
+                    exp, count, telemetry_dir=telemetry_dir if on_rocm else None
+                )
+                results.append(vllm_result)
 
-            guidellm_result["gpu_count"] = count
-            save_experiment_result(guidellm_result, experiments_dir, exp_id, timestamp)
+                if vllm_result["success"]:
+                    guidellm_result = run_guidellm(exp, reports_dir, exp_id, timestamp)
+                    results.append(guidellm_result)
+                else:
+                    guidellm_result = {
+                        "name": exp.name,
+                        "engine": "guidellm",
+                        "success": False,
+                        "stdout": "",
+                        "stderr": "vLLM server failed to start.",
+                    }
+                    results.append(guidellm_result)
 
-            stop_vllm_server(server_process)
+                guidellm_result["gpu_count"] = count
+                if on_rocm:
+                    guidellm_result["telemetry_dir"] = str(telemetry_dir)
+                save_experiment_result(guidellm_result, experiments_dir, exp_id, timestamp)
+
+                stop_vllm_server(server_process)
+            finally:
+                if sampler is not None:
+                    sampler.stop()
+                if on_rocm:
+                    (telemetry_dir / "nic_after.json").write_text(
+                        json.dumps(rocm.nic_counters(), indent=2), encoding="utf-8")
 
             task = asyncio.create_task(plot_results_async(results.copy(), output_dir / "plots"))
             pending_plots.append(task)
