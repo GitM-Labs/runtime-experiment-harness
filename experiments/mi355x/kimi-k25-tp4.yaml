@@ -1,0 +1,45 @@
+# Direct reproduction of the InferenceX "MI355X (vLLM) INT4" HEADLINE rows.
+# Their published detail table (read 2026-09-17) shows the 2748.8 tok/s/chip
+# peak is TP4 on 4 CHIPS at concurrency 128 — NOT TP8 on 8 chips (TP8 tops out
+# at 1583.9). We had been benchmarking TP8; this runs their actual config.
+#
+# Plain vLLM benchmarking, no kernel tracing (off by default). One TP4 server
+# on 4 GPUs; tok/s/chip = throughput / 4. On the full 8-GPU node you'd run two
+# TP4 replicas for 2x aggregate at the same per-chip rate.
+#
+# Target (their numbers), tok/s/chip @ P50 interactivity tok/s/user:
+#   c4  335.5 @ 78.5 | c8  552.7 @ 64.7 | c16 853.4 @ 49.9 (TP8 rows)
+#   c32 1812.2 @ 26.5 | c64 2330.1 @ 16.7 | c128 2748.8 @ 9.8   (TP4 rows)
+# Run on :latest (loads the kimi_k25 tokenizer):
+#   ./scripts/launch_mi355x_shards.sh kimi-k25-tp4
+gpu_counts:
+- 4
+experiments:
+- name: kimi-k25-tp4
+  model: moonshotai/Kimi-K2.5
+  prompt: unused
+  tp: 4
+  env: {VLLM_ROCM_USE_AITER: '1'}
+  vllm_args:
+  - --trust-remote-code
+  - --gpu-memory-utilization
+  - '0.92'
+  - --max-num-batched-tokens
+  - '8192'
+  - --max-num-seqs
+  - '256'
+  - --no-enable-prefix-caching
+  - --mm-encoder-tp-mode
+  - data
+  - --tool-call-parser
+  - kimi_k2
+  - --enable-auto-tool-choice
+  - --reasoning-parser
+  - kimi_k2
+  guidellm_passes:
+  - {name: 8k1k-c4,   metadata: {isl: 8192, osl: 1024, concurrency: 4},   guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=4,warmup=0.1,cooldown=0.1',   --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}
+  - {name: 8k1k-c8,   metadata: {isl: 8192, osl: 1024, concurrency: 8},   guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=8,warmup=0.1,cooldown=0.1',   --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}
+  - {name: 8k1k-c16,  metadata: {isl: 8192, osl: 1024, concurrency: 16},  guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=16,warmup=0.1,cooldown=0.1',  --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}
+  - {name: 8k1k-c32,  metadata: {isl: 8192, osl: 1024, concurrency: 32},  guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=32,warmup=0.1,cooldown=0.1',  --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}
+  - {name: 8k1k-c64,  metadata: {isl: 8192, osl: 1024, concurrency: 64},  guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=64,warmup=0.1,cooldown=0.1',  --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}
+  - {name: 8k1k-c128, metadata: {isl: 8192, osl: 1024, concurrency: 128}, guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=128,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}

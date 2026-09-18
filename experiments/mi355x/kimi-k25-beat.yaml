@@ -1,0 +1,136 @@
+# "Beat InferenceX" sweep for Kimi-K2.5 INT4 on one 8x MI355X node.
+# Target: MI355X (vLLM) INT4 8K/1K peak = 2748.8 tok/s/chip @ 9.8 tok/s/user.
+#
+# Motivated by the c8 rocprof trace (2026-09-16): ~90% of GPU kernel time was
+# COLLECTIVES (aiter cross_device_reduce_2stage 46% + ncclDevKernel 44%), MoE
+# only ~3% (and on the slow Triton fused_moe_kernel_gptq_awq path, not AITER),
+# GPU ~8% active at c8. So the throughput lever is cutting the TP8 all-reduce,
+# not the MoE kernel. This sweep tests that at HIGH concurrency (where the peak
+# lives), four topology/collective configs, each swept c64/128/256 on 8K/1K:
+#
+#   beat-baseline     TP8, plain (their recipe)          -> reference
+#   beat-quickreduce  TP8 + Quick Reduce INT4 all-reduce -> cheaper all-reduce
+#   beat-dp-ep        TP2 x DP4 + expert-parallel        -> TP8 all-reduce (8 GPU)
+#                       becomes cheap TP2 all-reduce (2 GPU) + MoE all-to-all
+#   beat-dp-ep-qr     TP2 x DP4 + EP + Quick Reduce      -> both
+#   beat-trace        TP8, ONE short c128 pass, rocprof ON -> the high-conc
+#                       kernel trace we lack (kept short so rocprof exits
+#                       cleanly; runs LAST so a rocprof stall can't lose the
+#                       throughput data). Analyze with rocprof_kernel_summary.py.
+#
+# Feasibility: model ~500GB INT4. TP8=62GB/GPU, TP2=250GB/GPU (fits <288).
+# DP+EP keeps TP=2 so each replica holds the model; TP1/DP8 would NOT fit.
+# Run on :latest (loads the kimi_k25 tokenizer; v0.24.0 cannot via guidellm):
+#   ./scripts/launch_mi355x_shards.sh kimi-k25-beat
+gpu_counts:
+- 8
+
+_common_passes: &passes
+  - {name: 8k1k-c64,  metadata: {isl: 8192, osl: 1024, concurrency: 64},  guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=64,warmup=0.1,cooldown=0.1',  --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}
+  - {name: 8k1k-c128, metadata: {isl: 8192, osl: 1024, concurrency: 128}, guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=128,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}
+  - {name: 8k1k-c256, metadata: {isl: 8192, osl: 1024, concurrency: 256}, guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=256,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}
+
+_base_vllm: &base_vllm
+  - --trust-remote-code
+  - --gpu-memory-utilization
+  - '0.92'
+  - --max-num-batched-tokens
+  - '8192'
+  - --max-num-seqs
+  - '256'
+  - --no-enable-prefix-caching
+  - --mm-encoder-tp-mode
+  - data
+  - --tool-call-parser
+  - kimi_k2
+  - --enable-auto-tool-choice
+  - --reasoning-parser
+  - kimi_k2
+
+experiments:
+
+- name: beat-baseline
+  model: moonshotai/Kimi-K2.5
+  prompt: unused
+  tp: 8
+  env: {VLLM_ROCM_USE_AITER: '1', REX_NO_ROCPROF: '1'}
+  vllm_args: *base_vllm
+  guidellm_passes: *passes
+
+- name: beat-quickreduce
+  model: moonshotai/Kimi-K2.5
+  prompt: unused
+  tp: 8
+  env: {VLLM_ROCM_USE_AITER: '1', VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: INT4, REX_NO_ROCPROF: '1'}
+  vllm_args: *base_vllm
+  guidellm_passes: *passes
+
+- name: beat-dp-ep
+  model: moonshotai/Kimi-K2.5
+  prompt: unused
+  tp: 2
+  env: {VLLM_ROCM_USE_AITER: '1', REX_NO_ROCPROF: '1'}
+  # TP2 x DP4 across the 8 GPUs, experts sharded expert-parallel. The per-layer
+  # all-reduce now spans only 2 GPUs instead of 8; MoE uses all-to-all dispatch.
+  vllm_args:
+  - --tensor-parallel-size
+  - '2'
+  - --data-parallel-size
+  - '4'
+  - --enable-expert-parallel
+  - --trust-remote-code
+  - --gpu-memory-utilization
+  - '0.92'
+  - --max-num-batched-tokens
+  - '8192'
+  - --max-num-seqs
+  - '256'
+  - --no-enable-prefix-caching
+  - --mm-encoder-tp-mode
+  - data
+  - --tool-call-parser
+  - kimi_k2
+  - --enable-auto-tool-choice
+  - --reasoning-parser
+  - kimi_k2
+  guidellm_passes: *passes
+
+- name: beat-dp-ep-qr
+  model: moonshotai/Kimi-K2.5
+  prompt: unused
+  tp: 2
+  env: {VLLM_ROCM_USE_AITER: '1', VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: INT4, REX_NO_ROCPROF: '1'}
+  vllm_args:
+  - --tensor-parallel-size
+  - '2'
+  - --data-parallel-size
+  - '4'
+  - --enable-expert-parallel
+  - --trust-remote-code
+  - --gpu-memory-utilization
+  - '0.92'
+  - --max-num-batched-tokens
+  - '8192'
+  - --max-num-seqs
+  - '256'
+  - --no-enable-prefix-caching
+  - --mm-encoder-tp-mode
+  - data
+  - --tool-call-parser
+  - kimi_k2
+  - --enable-auto-tool-choice
+  - --reasoning-parser
+  - kimi_k2
+  guidellm_passes: *passes
+
+# LAST, and rocprof ON (no REX_NO_ROCPROF): one short high-concurrency pass to
+# capture the kernel trace we lack at peak load. Short window so rocprofv3
+# exits cleanly instead of stalling the server as it did on the 3h pareto run.
+- name: beat-trace
+  model: moonshotai/Kimi-K2.5
+  prompt: unused
+  tp: 8
+  env: {VLLM_ROCM_USE_AITER: '1'}
+  vllm_args: *base_vllm
+  guidellm_passes:
+  - {name: 8k1k-c128-traced, metadata: {isl: 8192, osl: 1024, concurrency: 128}, guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=128,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=150', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}
