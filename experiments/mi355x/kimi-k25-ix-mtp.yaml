@@ -1,0 +1,16 @@
+# RETIRED 2026-09-15 — do not launch. Safe to `git rm`.
+#
+# The released Kimi-K2.5 checkpoint (snapshot 4d01dfe0) ships NO MTP head:
+# text_config.num_nextn_predict_layers = 0 and the safetensors index contains
+# zero mtp/nextn/eh_proj tensors. vLLM's rejection ("Unsupported speculative
+# method: 'mtp'") was the correct outcome — there are no draft weights to run.
+# This build's MTPModelTypes has kimi_k3_mtp but no K2.5 entry because no such
+# head exists to support.
+#
+# MTP controls from the 2026-09-15 runs remain valid low-concurrency baseline
+# rows (results/kimi-k25-ix-mtp/ and the inferencex run's -False- dirs).
+# The speculative-decoding path for K2.5, if pursued, is training an EAGLE3
+# draft head (this vLLM build supports eagle3) — see inferencex-k25-notes.md.
+gpu_counts:
+- 8
+experiments: []

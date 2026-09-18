@@ -1,0 +1,69 @@
+# Reproduction of the SemiAnalysis InferenceX Kimi-K2.6 vLLM lane on 8x MI355X.
+# Source: https://inferencex.semianalysis.com/inference/kimi-k26
+# Page (read 2026-09-15): model "Kimi K2.5/2.6/2.7-Code 1T", shape 8K/1K,
+# quant FP4, fixed-sequence track, run dated 2026-08-22. Headline chart is
+# Total Tokens per $1 TCO (y) vs Interactivity = tok/s/user (x), swept over
+# concurrency. MI355X TCO = $1.50/chip/hr (their July 2026 survey).
+#
+# ONE server launch, a guidellm pass per concurrency point at 8K/1K; the
+# harness prints the InferenceX metrics table (E2E/TTFT/ITL + tok/s/user +
+# tok/s/GPU) at completion, and scripts/inferencex_repro_plot.py converts to
+# their exact axes (tok/$ TCO vs interactivity).
+#
+# ⚠️ This matches their METHODOLOGY. Matching their NUMBERS additionally needs
+# the values tagged VERIFY. A reproduction is only as exact as its matched:
+# model+quant, vLLM build, topology, traffic definition, tuned flags.
+#
+#   VERIFY-1 model: the FP4 checkpoint InferenceX served. The chart is FP4, so
+#            this must be an FP4/quark (or ATOM A4W4-equivalent) Kimi-K2.6-Code
+#            checkpoint, NOT the INT4 moonshotai/Kimi-K2.5 we used before. Set
+#            the exact HF id + --revision. Wrong quant => wrong curve.
+#   VERIFY-2 image: their exact vLLM ROCm image digest (a different build moves
+#            numbers more than any flag here). Pin it in deploy/mi355x-rex-job.yaml.
+#   VERIFY-3 topology: TP/EP/DP they used for the plain "MI355X (vLLM)" point
+#            (the page also has MI355X VLLM-DISAGG and ATOM points — reproduce
+#            the plain vLLM lane, TP8 single node, unless matching a disagg point).
+#   VERIFY-4 traffic: page says fixed-sequence 8K/1K. Confirm whether the swept
+#            axis is fixed CONCURRENCY (streams=N, below) or fixed REQUEST-RATE
+#            (rate=N). If request-rate, swap every 'kind=concurrent,streams=N'
+#            for 'kind=constant,rate=N'. Most common repro mismatch.
+#   VERIFY-5 flags: their tuned vLLM args for the FP4 lane (quantization=,
+#            kv dtype, block-size, scheduler, aiter envs).
+#   VERIFY-6 measurement: warmup / window / request count (300s + 10% is a
+#            placeholder).
+gpu_counts:
+- 8
+experiments:
+- name: kimi-k26-repro
+  model: moonshotai/Kimi-K2.6          # VERIFY-1  (id + pin a --revision in vllm_args if the page names one)
+  prompt: unused - guidellm passes supply synthetic data
+  tp: 8                                # VERIFY-3
+  env:
+    VLLM_ROCM_USE_AITER: '1'           # VERIFY-5
+    REX_NO_ROCPROF: '1'                # repro needs serving numbers, not traces; tracing also throttles a long server
+  vllm_args:                           # VERIFY-5: replace wholesale with the page's tuned flags
+  - --trust-remote-code
+  - --tensor-parallel-size
+  - '8'
+  - --gpu-memory-utilization
+  - '0.92'
+  - --max-num-batched-tokens
+  - '8192'
+  - --max-num-seqs
+  - '256'
+  - --tool-call-parser
+  - kimi_k2
+  - --enable-auto-tool-choice
+  - --reasoning-parser
+  - kimi_k2
+  # VERIFY-4: shapes and concurrency ladder below are the InferenceX-standard
+  # set; trim/extend to exactly the page's points. Each pass: max_tokens and
+  # output_tokens = OSL; prompt_tokens = ISL; streams = concurrency.
+  guidellm_passes:
+  - {name: 8k1k-c1,   metadata: {isl: 8192, osl: 1024, concurrency: 1},   guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.6,max_tokens=1024', --profile, 'kind=concurrent,streams=1,warmup=0.1,cooldown=0.1',   --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}
+  - {name: 8k1k-c8,   metadata: {isl: 8192, osl: 1024, concurrency: 8},   guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.6,max_tokens=1024', --profile, 'kind=concurrent,streams=8,warmup=0.1,cooldown=0.1',   --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}
+  - {name: 8k1k-c16,  metadata: {isl: 8192, osl: 1024, concurrency: 16},  guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.6,max_tokens=1024', --profile, 'kind=concurrent,streams=16,warmup=0.1,cooldown=0.1',  --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}
+  - {name: 8k1k-c32,  metadata: {isl: 8192, osl: 1024, concurrency: 32},  guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.6,max_tokens=1024', --profile, 'kind=concurrent,streams=32,warmup=0.1,cooldown=0.1',  --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}
+  - {name: 8k1k-c64,  metadata: {isl: 8192, osl: 1024, concurrency: 64},  guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.6,max_tokens=1024', --profile, 'kind=concurrent,streams=64,warmup=0.1,cooldown=0.1',  --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}
+  - {name: 8k1k-c128, metadata: {isl: 8192, osl: 1024, concurrency: 128}, guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.6,max_tokens=1024', --profile, 'kind=concurrent,streams=128,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}
+  - {name: 8k1k-c256, metadata: {isl: 8192, osl: 1024, concurrency: 256}, guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.6,max_tokens=1024', --profile, 'kind=concurrent,streams=256,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}

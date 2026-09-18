@@ -1,0 +1,40 @@
+# beat arm 3/5 — TP2 x DP4 + expert-parallel. Parallel shard. The per-layer
+# all-reduce spans 2 GPUs instead of 8; MoE uses all-to-all dispatch. This is
+# the direct counter to the ~90%-collective finding. TP=2 so the ~500GB model
+# still fits per replica (250GB/GPU); TP1/DP8 would not fit.
+gpu_counts:
+- 8
+experiments:
+- name: beat-dp-ep
+  model: moonshotai/Kimi-K2.5
+  prompt: unused
+  tp: 2
+  # DP+EP starts 8 engine-core processes; their combined load + graph capture
+  # exceeds vLLM's default 600s engine-ready timeout (TP8's single core makes
+  # it in ~7min). Raise it so the frontend waits for all 8 to come up.
+  env: {VLLM_ROCM_USE_AITER: '1', VLLM_ENGINE_READY_TIMEOUT_S: '1800', REX_NO_ROCPROF: '1'}
+  vllm_args:
+  - --tensor-parallel-size
+  - '2'
+  - --data-parallel-size
+  - '4'
+  - --enable-expert-parallel
+  - --trust-remote-code
+  - --gpu-memory-utilization
+  - '0.92'
+  - --max-num-batched-tokens
+  - '8192'
+  - --max-num-seqs
+  - '256'
+  - --no-enable-prefix-caching
+  - --mm-encoder-tp-mode
+  - data
+  - --tool-call-parser
+  - kimi_k2
+  - --enable-auto-tool-choice
+  - --reasoning-parser
+  - kimi_k2
+  guidellm_passes:
+  - {name: 8k1k-c64,  metadata: {isl: 8192, osl: 1024, concurrency: 64},  guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=64,warmup=0.1,cooldown=0.1',  --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}
+  - {name: 8k1k-c128, metadata: {isl: 8192, osl: 1024, concurrency: 128}, guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=128,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}
+  - {name: 8k1k-c256, metadata: {isl: 8192, osl: 1024, concurrency: 256}, guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=256,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']}
