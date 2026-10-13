@@ -21,6 +21,11 @@ cd "$(dirname "$0")/.."
 
 REX_DIR="${REX_DIR:-/mnt/shared/rex}"
 STAGE_POD="${STAGE_POD:-rex-stage}"
+# Container image for the rex Job. Default keeps prior behavior; override to pin
+# a specific vLLM ROCm build for a reproduction, e.g.
+#   IMAGE=vllm/vllm-openai-rocm:v0.24.0 ./scripts/launch_mi355x_shards.sh kimi-k25-int4-repro
+# (:latest drifts — always pin for a result you intend to compare or publish.)
+IMAGE="${IMAGE:-vllm/vllm-openai-rocm:latest}"
 ONLY_SHARD="${1:-}"
 # Optional second arg: node count for that shard (requires ONLY_SHARD).
 COUNT_OVERRIDE="${2:-}"
@@ -32,6 +37,21 @@ fi
 # which has no associative arrays)
 BUDGET=(
   kimi-k25=4
+  kimi-k25-inferencex=2
+  kimi-k25-ix-pareto=1
+  kimi-k25-int4-repro=1
+  kimi-k25-tp4=1
+  kimi-k25-tp2-dp4-qr=1
+  kimi-k25-tp4-dp2-qr=1
+  kimi-k25-tp8-qr=1
+  kimi-k25-tp2-dp4-ep-qr=1
+  kimi-k25-tp4-dp2-ep-qr=1
+  beat-baseline=1
+  beat-quickreduce=1
+  beat-dp-ep=1
+  beat-dp-ep-qr=1
+  beat-trace=1
+  kimi-k26-inferencex-repro=1
   kimi-k3=2
   deepseek-v4-flash=2
   deepseek-v4-pro=2
@@ -85,10 +105,16 @@ for entry in "${BUDGET[@]}"; do
     continue
   fi
   for index in $(seq 1 "${COUNT_OVERRIDE:-${count}}"); do
+    job="rex-${shard}-${index}"
+    # A Job's pod template is immutable, so `kubectl apply` over a prior run of
+    # the same name fails ("field is immutable"). Delete any existing Job first
+    # (a completed/failed one, or one being relaunched) so create always works.
+    kubectl delete job "${job}" --ignore-not-found --wait=true
     sed -e "s|__SHARD__|${shard}|g" \
         -e "s|__INDEX__|${index}|g" \
         -e "s|__REX_DIR__|${REX_DIR}|g" \
-        deploy/mi355x-rex-job.yaml | kubectl apply -f -
+        -e "s|__IMAGE__|${IMAGE}|g" \
+        deploy/mi355x-rex-job.yaml | kubectl create -f -
   done
 done
 

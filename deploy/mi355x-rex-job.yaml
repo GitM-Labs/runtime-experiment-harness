@@ -32,7 +32,7 @@ spec:
         effect: NoSchedule
       containers:
       - name: rex
-        image: vllm/vllm-openai-rocm:latest
+        image: __IMAGE__   # substituted by launch_mi355x_shards.sh (IMAGE env; default :latest — pin for reproductions)
         command: ["/bin/bash", "-lc"]
         args:
         - |

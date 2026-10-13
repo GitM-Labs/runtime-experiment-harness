@@ -1,0 +1,133 @@
+# Hand-written: InferenceX-style Pareto sweep for Kimi K2.5, one 8x MI355X
+# node. ONE server launch (tuned TP8 config), then a guidellm pass per
+# (ISL/OSL shape, concurrency) point — 4 shapes x {1,4,8,16,32,64,128}.
+# The model loads once; passes reuse the live server (guidellm_passes).
+#
+# Pareto axes per shape: x = tok/s/user (per-request output speed, ~1/ITL),
+# y = tok/s/GPU (total output throughput / 8). Points come from each pass's
+# guidellm report; the frontier is the upper envelope across concurrency.
+# 8k-out passes get 420s (a single 8k generation takes minutes; 300s would
+# leave low-concurrency points with ~1 completed request).
+#
+# Passes carry no --output: the harness assigns each pass its own report and
+# result file (suffixing the pass name), so points cannot overwrite each
+# other. ~3.2h/node; sweep is resumable only at experiment granularity, so a
+# preemption mid-ladder loses only unfinished passes' points.
+gpu_counts:
+- 8
+experiments:
+- name: kimi-k25-ix-pareto
+  model: moonshotai/Kimi-K2.5
+  prompt: unused - guidellm passes supply synthetic data
+  tp: 8
+  env:
+    VLLM_ROCM_USE_AITER: '1'
+    # No kernel tracing on the Pareto server: the curve needs serving numbers
+    # only, tracing overhead is quantified elsewhere (rocprof-overhead), and a
+    # ~3h continuously-traced session accumulates unusable multi-GB traces —
+    # and is the prime suspect in the 2026-09-15 first-run server death ~30min in.
+    REX_NO_ROCPROF: '1'
+  vllm_args:
+  - --trust-remote-code
+  - --tensor-parallel-size
+  - '8'
+  - --gpu-memory-utilization
+  - '0.92'
+  - --max-num-batched-tokens
+  - '8192'
+  - --max-num-seqs
+  - '256'
+  - --tool-call-parser
+  - kimi_k2
+  - --enable-auto-tool-choice
+  - --reasoning-parser
+  - kimi_k2
+  guidellm_passes:
+  # ---------------- 1k in / 1k out ----------------
+  - name: 1k1k-c1
+    metadata: {isl: 1024, osl: 1024, concurrency: 1}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=1,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=1024,output_tokens=1024']
+  - name: 1k1k-c4
+    metadata: {isl: 1024, osl: 1024, concurrency: 4}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=4,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=1024,output_tokens=1024']
+  - name: 1k1k-c8
+    metadata: {isl: 1024, osl: 1024, concurrency: 8}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=8,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=1024,output_tokens=1024']
+  - name: 1k1k-c16
+    metadata: {isl: 1024, osl: 1024, concurrency: 16}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=16,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=1024,output_tokens=1024']
+  - name: 1k1k-c32
+    metadata: {isl: 1024, osl: 1024, concurrency: 32}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=32,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=1024,output_tokens=1024']
+  - name: 1k1k-c64
+    metadata: {isl: 1024, osl: 1024, concurrency: 64}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=64,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=1024,output_tokens=1024']
+  - name: 1k1k-c128
+    metadata: {isl: 1024, osl: 1024, concurrency: 128}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=128,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=1024,output_tokens=1024']
+  # ---------------- 1k in / 8k out ----------------
+  - name: 1k8k-c1
+    metadata: {isl: 1024, osl: 8192, concurrency: 1}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=8192', --profile, 'kind=concurrent,streams=1,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=1200', --data, 'kind=synthetic_text,prompt_tokens=1024,output_tokens=8192']
+  - name: 1k8k-c4
+    metadata: {isl: 1024, osl: 8192, concurrency: 4}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=8192', --profile, 'kind=concurrent,streams=4,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=1200', --data, 'kind=synthetic_text,prompt_tokens=1024,output_tokens=8192']
+  - name: 1k8k-c8
+    metadata: {isl: 1024, osl: 8192, concurrency: 8}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=8192', --profile, 'kind=concurrent,streams=8,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=1200', --data, 'kind=synthetic_text,prompt_tokens=1024,output_tokens=8192']
+  - name: 1k8k-c16
+    metadata: {isl: 1024, osl: 8192, concurrency: 16}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=8192', --profile, 'kind=concurrent,streams=16,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=1200', --data, 'kind=synthetic_text,prompt_tokens=1024,output_tokens=8192']
+  - name: 1k8k-c32
+    metadata: {isl: 1024, osl: 8192, concurrency: 32}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=8192', --profile, 'kind=concurrent,streams=32,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=1200', --data, 'kind=synthetic_text,prompt_tokens=1024,output_tokens=8192']
+  - name: 1k8k-c64
+    metadata: {isl: 1024, osl: 8192, concurrency: 64}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=8192', --profile, 'kind=concurrent,streams=64,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=1200', --data, 'kind=synthetic_text,prompt_tokens=1024,output_tokens=8192']
+  - name: 1k8k-c128
+    metadata: {isl: 1024, osl: 8192, concurrency: 128}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=8192', --profile, 'kind=concurrent,streams=128,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=1200', --data, 'kind=synthetic_text,prompt_tokens=1024,output_tokens=8192']
+  # ---------------- 8k in / 1k out (InferenceX headline shape) ----------------
+  - name: 8k1k-c1
+    metadata: {isl: 8192, osl: 1024, concurrency: 1}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=1,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']
+  - name: 8k1k-c4
+    metadata: {isl: 8192, osl: 1024, concurrency: 4}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=4,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']
+  - name: 8k1k-c8
+    metadata: {isl: 8192, osl: 1024, concurrency: 8}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=8,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']
+  - name: 8k1k-c16
+    metadata: {isl: 8192, osl: 1024, concurrency: 16}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=16,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']
+  - name: 8k1k-c32
+    metadata: {isl: 8192, osl: 1024, concurrency: 32}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=32,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']
+  - name: 8k1k-c64
+    metadata: {isl: 8192, osl: 1024, concurrency: 64}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=64,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']
+  - name: 8k1k-c128
+    metadata: {isl: 8192, osl: 1024, concurrency: 128}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024', --profile, 'kind=concurrent,streams=128,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=300', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=1024']
+  # ---------------- 8k in / 8k out ----------------
+  - name: 8k8k-c1
+    metadata: {isl: 8192, osl: 8192, concurrency: 1}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=8192', --profile, 'kind=concurrent,streams=1,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=1200', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=8192']
+  - name: 8k8k-c4
+    metadata: {isl: 8192, osl: 8192, concurrency: 4}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=8192', --profile, 'kind=concurrent,streams=4,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=1200', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=8192']
+  - name: 8k8k-c8
+    metadata: {isl: 8192, osl: 8192, concurrency: 8}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=8192', --profile, 'kind=concurrent,streams=8,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=1200', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=8192']
+  - name: 8k8k-c16
+    metadata: {isl: 8192, osl: 8192, concurrency: 16}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=8192', --profile, 'kind=concurrent,streams=16,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=1200', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=8192']
+  - name: 8k8k-c32
+    metadata: {isl: 8192, osl: 8192, concurrency: 32}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=8192', --profile, 'kind=concurrent,streams=32,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=1200', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=8192']
+  - name: 8k8k-c64
+    metadata: {isl: 8192, osl: 8192, concurrency: 64}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=8192', --profile, 'kind=concurrent,streams=64,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=1200', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=8192']
+  - name: 8k8k-c128
+    metadata: {isl: 8192, osl: 8192, concurrency: 128}
+    guidellm_command: [run, --backend, 'kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=8192', --profile, 'kind=concurrent,streams=128,warmup=0.1,cooldown=0.1', --constraint, 'kind=max_duration,seconds=1200', --data, 'kind=synthetic_text,prompt_tokens=8192,output_tokens=8192']

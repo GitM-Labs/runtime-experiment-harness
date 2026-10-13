@@ -1,0 +1,202 @@
+# Hand-written (not from gen_mi355x_manifests.py): InferenceX-improvement lane
+# for Kimi K2.5 on one 8x MI355X node. Traffic is 8k/1k to match the
+# InferenceX K2.5 lane shape (the kimi-k25 shard sweeps 16k/1k).
+#
+# Every experiment carries its own control variant on identical traffic, so
+# each claim is a paired A/B: (technique on vs off, same node, same streams).
+#
+# MTP speculative decoding was REMOVED 2026-09-15: the released K2.5
+# checkpoint ships no MTP head (num_nextn_predict_layers=0, no mtp/nextn/
+# eh_proj tensors), so every MTP arm fails at config validation by design of
+# reality, not of vLLM. See inferencex-k25-notes.md for the EAGLE3 path.
+#
+# ATOM parity items that need vLLM code (A4W4 activation quant + fused MoE
+# dispatch, fused router) and multi-node disagg are NOT here — see
+# inferencex-k25-notes.md.
+#
+# VERIFY-FLAG notes: an unknown vLLM env var silently no-ops and the arm then
+# measures the baseline while claiming a technique. Before trusting any arm
+# marked VERIFY, confirm in its telemetry server.log that the option actually
+# took effect (vLLM echoes its config at startup).
+#
+# Variant names must never be bare off/on/yes/no: YAML 1.1 parses those as
+# booleans and the arm runs named "False" (happened on the 2026-09-15 run).
+gpu_counts:
+- 8
+experiments:
+
+# ---- Engine/scheduler/env levers at the throughput point (streams=16).
+# One experiment, control + one variant per lever, so each lever's delta is
+# attributable on identical traffic.
+- name: kimi-k25-ix-levers
+  model: moonshotai/Kimi-K2.5
+  prompt: unused - guidellm_command supplies synthetic data
+  tp: 8
+  env:
+    VLLM_ROCM_USE_AITER: '1'
+  vllm_args:
+  - --trust-remote-code
+  - --tensor-parallel-size
+  - '8'
+  - --gpu-memory-utilization
+  - '0.92'
+  - --max-num-batched-tokens
+  - '8192'
+  - --max-num-seqs
+  - '256'
+  - --tool-call-parser
+  - kimi_k2
+  - --enable-auto-tool-choice
+  - --reasoning-parser
+  - kimi_k2
+  guidellm_command:
+  - run
+  - --backend
+  - kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024
+  - --profile
+  - kind=concurrent,streams=16,warmup=0.1,cooldown=0.1
+  - --constraint
+  - kind=max_duration,seconds=300
+  - --data
+  - kind=synthetic_text,prompt_tokens=8192,output_tokens=1024
+  - --output
+  - kind=json,path=/workspace/kimi-k25-ix-levers.json
+  variants:
+  - name: control
+    metadata:
+      arm: control
+  - name: sched-delay
+    vllm_args:
+    - --scheduler-delay-factor
+    - '1'
+    - --async-scheduling
+    metadata:
+      arm: scheduler
+      note: ATOM's prefill-admission batching; expect smoother high-conc ITL
+        at negligible TTFT cost.
+  - name: kv-fp8
+    vllm_args:
+    - --kv-cache-dtype
+    - fp8
+    metadata:
+      arm: kv-fp8
+  - name: aiter-mla
+    env:
+      VLLM_ROCM_USE_AITER_MLA: '1'
+      VLLM_ROCM_USE_AITER_FA: '1'
+    metadata:
+      arm: aiter-mla
+      note: 'K3-lane pattern: AITER MLA decode + FA prefill. VERIFY-FLAG:
+        confirm both envs are recognized by this vLLM build in server.log.'
+  - name: quickreduce-int4
+    env:
+      VLLM_ROCM_QUICK_REDUCE_QUANTIZATION: INT4
+    metadata:
+      arm: quickreduce
+      note: Proven on the DSV4 MI355X 8k/1k lane; TP-aware gating stays
+        one-stage through batch 16 at TP8.
+  - name: rust-frontend
+    env:
+      VLLM_USE_RUST_FRONTEND: '1'
+    metadata:
+      arm: frontend
+      note: 'VERIFY-FLAG: used on the MiniMax MI355X lane; confirm this vLLM
+        build ships the rust frontend, else this arm silently measures control.'
+
+# ---- TP4 (x2 replicas story): keeps expert GEMMs above the kernels'
+# efficiency knee and collectives cheap. Runs ONE TP4 replica on 4 of the 8
+# GPUs; the x2-replica number is 2x this replica's throughput (report
+# per-GPU tok/s next to the TP8 rows).
+- name: kimi-k25-ix-tp4
+  model: moonshotai/Kimi-K2.5
+  prompt: unused - guidellm_command supplies synthetic data
+  tp: 4
+  env:
+    VLLM_ROCM_USE_AITER: '1'
+  vllm_args:
+  - --trust-remote-code
+  - --tensor-parallel-size
+  - '4'
+  - --gpu-memory-utilization
+  - '0.92'
+  - --max-num-batched-tokens
+  - '8192'
+  - --max-num-seqs
+  - '256'
+  - --tool-call-parser
+  - kimi_k2
+  - --enable-auto-tool-choice
+  - --reasoning-parser
+  - kimi_k2
+  guidellm_command:
+  - run
+  - --backend
+  - kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024
+  - --profile
+  - kind=concurrent,streams=16,warmup=0.1,cooldown=0.1
+  - --constraint
+  - kind=max_duration,seconds=300
+  - --data
+  - kind=synthetic_text,prompt_tokens=8192,output_tokens=1024
+  - --output
+  - kind=json,path=/workspace/kimi-k25-ix-tp4.json
+  variants:
+  - name: base
+    metadata:
+      arm: tp4
+      note: Compare per-GPU tok/s against kimi-k25-ix-levers control (TP8).
+        The routed experts are INT4 weight-quantized (compressed-tensors);
+        if the server faults at load, the March CK MoE fault at TP4/EP4 with
+        96 local experts is the first suspect.
+
+# ---- DP attention + EP (+ dual-batch overlap): MLA KV not replicated
+# across TP ranks, comm overlapped with compute. tp: 1 here so the harness
+# emits --tensor-parallel-size 1; DP spans the 8 GPUs.
+- name: kimi-k25-ix-dp-attn
+  model: moonshotai/Kimi-K2.5
+  prompt: unused - guidellm_command supplies synthetic data
+  tp: 1
+  env:
+    VLLM_ROCM_USE_AITER: '1'
+  vllm_args:
+  - --trust-remote-code
+  - --tensor-parallel-size
+  - '1'
+  - --data-parallel-size
+  - '8'
+  - --enable-expert-parallel
+  - --gpu-memory-utilization
+  - '0.92'
+  - --max-num-batched-tokens
+  - '8192'
+  - --max-num-seqs
+  - '256'
+  - --tool-call-parser
+  - kimi_k2
+  - --enable-auto-tool-choice
+  - --reasoning-parser
+  - kimi_k2
+  guidellm_command:
+  - run
+  - --backend
+  - kind=openai_http,target=http://localhost:8000/v1,model=moonshotai/Kimi-K2.5,max_tokens=1024
+  - --profile
+  - kind=concurrent,streams=16,warmup=0.1,cooldown=0.1
+  - --constraint
+  - kind=max_duration,seconds=300
+  - --data
+  - kind=synthetic_text,prompt_tokens=8192,output_tokens=1024
+  - --output
+  - kind=json,path=/workspace/kimi-k25-ix-dp-attn.json
+  variants:
+  - name: base
+    metadata:
+      arm: dp-attn
+      note: Compare against kimi-k25-ix-levers control (TP8, same traffic).
+  - name: dbo
+    vllm_args:
+    - --enable-dbo
+    metadata:
+      arm: dp-attn+dbo
+      note: 'VERIFY-FLAG: dual-batch overlap flag name; if this vLLM build
+        rejects --enable-dbo the arm fails at launch (loud, acceptable).'

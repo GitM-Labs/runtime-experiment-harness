@@ -27,8 +27,13 @@ from rich.console import Console
 
 console = Console()
 
-#: Escape hatch: set REX_NO_ROCPROF=1 to launch servers unwrapped (a clean arm
-#: for overhead comparison, or when rocprofv3 itself is the suspect).
+#: Kernel tracing is OPT-IN: set REX_ROCPROF=1 in an experiment's env to wrap
+#: its server in rocprofv3. Default off — the traces are large and rocprofv3
+#: can stall a long-lived server (it killed the 3h pareto run).
+ENV_ROCPROF = "REX_ROCPROF"
+
+#: Legacy explicit opt-out, still honored by rocprofv3_prefix's own guard.
+#: Redundant now that tracing is off by default, but harmless.
 ENV_NO_ROCPROF = "REX_NO_ROCPROF"
 
 #: Sampler cadence. The plan asks for 100 ms or better; the library path meets

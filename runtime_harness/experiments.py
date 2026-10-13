@@ -83,6 +83,22 @@ def experiment_id(experiment: "Experiment", gpu_count: int) -> str:
     return f"{experiment.name}-gpu{gpu_count}"
 
 
+def run_stamp() -> str:
+    """Unique per-run directory stamp: <utc second>-<host>-<random>.
+
+    The bare second-resolution timestamp collided when parallel nodes ran the
+    same manifest in lockstep on shared storage: two pods entered an arm in
+    the same second and interleaved rocprof traces into one run directory,
+    silently corrupting both copies. The host tag also records which node
+    produced the run, which is what repeat-counting needs anyway.
+    """
+    import secrets
+    import socket
+
+    host = re.sub(r"[^A-Za-z0-9-]", "-", socket.gethostname() or "host")[:24]
+    return f"{utc_timestamp()}-{host}-{secrets.token_hex(2)}"
+
+
 def save_experiment_result(result: dict, experiments_dir: Path, exp_id: str, timestamp=None) -> Path:
     """Write one guidellm result to experiments/<id>/<timestamp>_<id>.json.
 
@@ -140,6 +156,12 @@ class Experiment:
     # the one-run-per-model algorithm/protocol log). Manifest values win over
     # the inherited shell so an arm's env is what the manifest says it is.
     env: dict = dataclasses.field(default_factory=dict)
+    # Multiple guidellm runs against ONE server launch (a concurrency ladder
+    # for a Pareto sweep, say): the model loads once and every pass reuses it.
+    # Each entry is {"name", "command", "metadata"}; when non-empty,
+    # ``guidellm_command`` is ignored. Passes should NOT bake an --output
+    # path: the harness assigns each pass its own report and result file.
+    guidellm_passes: list = dataclasses.field(default_factory=list)
     # Present when the entry is driven by `gitm capture serve` instead of by
     # guidellm. The two are exclusive: gitm owns the server for a capture, because
     # the CUDA driver reads CUDA_INJECTION64_PATH once at CUDA init and a server
@@ -233,6 +255,34 @@ def expand_variants(raw: dict) -> list[dict]:
     return expanded
 
 
+def parse_guidellm_passes(raw):
+    """Normalize a manifest's ``guidellm_passes`` list.
+
+    Each pass must carry a name (it suffixes the report and result filenames,
+    so two passes with one name would overwrite each other) and its own
+    guidellm command; metadata is merged into the pass's saved result.
+    """
+    if not raw:
+        return []
+    passes = []
+    seen = set()
+    for item in raw:
+        if "name" not in item or "guidellm_command" not in item:
+            raise ValueError("Every guidellm pass needs a name and a guidellm_command.")
+        name = str(item["name"])
+        if name in seen:
+            raise ValueError(f"Duplicate guidellm pass name {name!r}.")
+        seen.add(name)
+        passes.append(
+            {
+                "name": name,
+                "command": normalize_arg_list(item["guidellm_command"]),
+                "metadata": item.get("metadata") or {},
+            }
+        )
+    return passes
+
+
 def load_experiments(config_path: Path):
     with config_path.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
@@ -269,6 +319,7 @@ def load_experiments(config_path: Path):
             guidellm_command=normalize_arg_list(raw.get("guidellm_command")),
             metadata=raw.get("metadata", {}),
             env={str(k): str(v) for k, v in (raw.get("env") or {}).items()},
+            guidellm_passes=parse_guidellm_passes(raw.get("guidellm_passes")),
             capture=capture_spec,
         )
         experiments.append(experiment)
@@ -325,6 +376,69 @@ def guidellm_launcher() -> list[str]:
     if guidellm_bin:
         return [guidellm_bin]
     return [sys.executable, "-m", "guidellm"]
+
+
+def parallelism_label(experiment: "Experiment") -> str:
+    """Human-readable parallelism, e.g. 'TP4', 'TP2xDP4', 'TP4xDP2+EP'.
+
+    Parsed from the actual vllm_args so it reflects what was launched, not just
+    the tp field. Used in the InferenceX-style results table.
+    """
+    args = experiment.vllm_args
+
+    def flag_val(flag):
+        for i, a in enumerate(args):
+            if a == flag and i + 1 < len(args):
+                return args[i + 1]
+            if a.startswith(flag + "="):
+                return a.split("=", 1)[1]
+        return None
+
+    tp = flag_val("--tensor-parallel-size") or str(experiment.tp)
+    dp = flag_val("--data-parallel-size")
+    label = f"TP{tp}"
+    if dp and dp not in ("1", None):
+        label += f"xDP{dp}"
+    if "--enable-expert-parallel" in args:
+        label += "+EP"
+    return label
+
+
+#: Root-cause signatures scanned in a failed server/guidellm log, most specific
+#: first. Each maps a substring to a concise reason; None means "quote the
+#: matching line verbatim" (for messages that already carry the specifics).
+_FAILURE_SIGNATURES = [
+    ("trust_remote_code", "tokenizer needs trust_remote_code — this image's transformers does not know the model type (use a newer image)"),
+    ("timed out waiting for engine core", "engine core startup exceeded VLLM_ENGINE_READY_TIMEOUT_S — raise it (DP spins up many cores)"),
+    ("out of memory", "GPU out of memory — lower --gpu-memory-utilization / --max-num-seqs, or increase tensor-parallel size"),
+    ("hip error", "HIP runtime error — see server.log (often OOM or an unsupported kernel/config)"),
+    ("unsupported speculative method", None),
+    ("no such option", None),
+    ("no gpus visible in the kfd topology", "container has no GPUs — check /dev/kfd and /dev/dri device access"),
+]
+
+
+def extract_failure_reason(text: str) -> str:
+    """One concrete sentence for why a launch failed, mined from its log.
+
+    Prefers a known signature; otherwise returns the last exception line in the
+    traceback (which is normally the root cause). Never a bare 'it failed'.
+    """
+    if not text or not text.strip():
+        return "no log captured (server produced no output before dying)"
+    low = text.lower()
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for needle, reason in _FAILURE_SIGNATURES:
+        if needle in low:
+            if reason is not None:
+                return reason
+            for ln in reversed(lines):  # quote the specific line
+                if needle in ln.lower():
+                    return ln[:300]
+    for ln in reversed(lines):  # last "SomethingError: message" line
+        if re.match(r"^[\w.]*(Error|Exception|Timeout)\b.*", ln):
+            return ln[:300]
+    return lines[-1][:300]
 
 
 def build_guidellm_command(experiment: Experiment):
@@ -489,9 +603,21 @@ async def start_vllm_server(
     on_rocm = rocm.is_rocm()
     server_log = None
     if on_rocm and telemetry_dir is not None:
-        prefix = rocm.rocprofv3_prefix(Path(telemetry_dir) / "rocprof")
-        if prefix:
-            command = prefix + command
+        # Kernel tracing is OFF by default: the rocprofv3 CSV/pftrace files are
+        # large, and rocprofv3 has stalled long-lived servers to death. Opt IN
+        # per experiment by setting REX_ROCPROF=1 in its env (e.g. one short
+        # arm dedicated to capturing a trace). server.log is always kept — it
+        # is how a failed launch is diagnosed — tracing or not.
+        trace_on = env.get(rocm.ENV_ROCPROF, "").strip() not in ("", "0")
+        if trace_on:
+            prefix = rocm.rocprofv3_prefix(Path(telemetry_dir) / "rocprof")
+            if prefix:
+                command = prefix + command
+        else:
+            console.log(
+                f"[dim]{experiment.name}: kernel tracing off "
+                f"(set {rocm.ENV_ROCPROF}=1 to capture)[/dim]"
+            )
         telemetry_dir = Path(telemetry_dir)
         telemetry_dir.mkdir(parents=True, exist_ok=True)
         server_log = (telemetry_dir / "server.log").open("w", encoding="utf-8")
@@ -532,6 +658,8 @@ async def start_vllm_server(
             "success": False,
             "stdout": "",
             "stderr": stderr,
+            "failure_reason": extract_failure_reason(stderr),
+            "server_log": str(server_log_path) if server_log_path else None,
         }, None
 
     deadline = asyncio.get_running_loop().time() + startup_timeout
@@ -778,7 +906,7 @@ async def run_all_experiments(
     for exp in experiments:
         for count in desired_gpu_counts:
             exp_id = experiment_id(exp, count)
-            timestamp = utc_timestamp()
+            timestamp = run_stamp()
 
             if exp.capture is not None:
                 if on_rocm:
@@ -815,25 +943,97 @@ async def run_all_experiments(
                 )
                 results.append(vllm_result)
 
-                if vllm_result["success"]:
-                    guidellm_result = run_guidellm(exp, reports_dir, exp_id, timestamp)
-                    results.append(guidellm_result)
+                if vllm_result["success"] and exp.guidellm_passes:
+                    # One server, many traffic points (a Pareto concurrency
+                    # ladder): the model loads once and every pass reuses it.
+                    # Each pass gets its own report and result file; a failed
+                    # pass is recorded and the remaining passes still run.
+                    for gpass in exp.guidellm_passes:
+                        if not server_is_ready(vllm_port(exp)):
+                            console.log(
+                                f"[red]vLLM server no longer serving before pass "
+                                f"{gpass['name']}; recording remaining passes as failed[/red]"
+                            )
+                            guidellm_result = {
+                                "name": f"{exp.name}-{gpass['name']}",
+                                "engine": "guidellm",
+                                "success": False,
+                                "stdout": "",
+                                "stderr": "vLLM server died mid-sweep; pass not run.",
+                                "failure_reason": vllm_result.get("failure_reason")
+                                or "vLLM server died mid-sweep",
+                                "server_log": vllm_result.get("server_log"),
+                                "gpu_count": count,
+                                "pass": gpass["name"],
+                                "parallelism": parallelism_label(exp),
+                                "precision": exp.metadata.get("precision", "INT4"),
+                                "metadata": {**exp.metadata, **gpass["metadata"]},
+                            }
+                            results.append(guidellm_result)
+                            save_experiment_result(
+                                guidellm_result, experiments_dir, exp_id,
+                                f"{timestamp}_{gpass['name']}",
+                            )
+                            continue
+                        pass_exp = dataclasses.replace(
+                            exp,
+                            name=f"{exp.name}-{gpass['name']}",
+                            guidellm_command=list(gpass["command"]),
+                        )
+                        guidellm_result = run_guidellm(
+                            pass_exp, reports_dir, f"{exp_id}-{gpass['name']}", timestamp
+                        )
+                        guidellm_result["gpu_count"] = count
+                        guidellm_result["pass"] = gpass["name"]
+                        guidellm_result["parallelism"] = parallelism_label(exp)
+                        guidellm_result["precision"] = exp.metadata.get("precision", "INT4")
+                        guidellm_result["metadata"] = {
+                            **exp.metadata,
+                            **gpass["metadata"],
+                        }
+                        if not guidellm_result.get("success"):
+                            guidellm_result["failure_reason"] = extract_failure_reason(
+                                guidellm_result.get("stderr", "")
+                            )
+                        if on_rocm:
+                            guidellm_result["telemetry_dir"] = str(telemetry_dir)
+                        results.append(guidellm_result)
+                        save_experiment_result(
+                            guidellm_result,
+                            experiments_dir,
+                            exp_id,
+                            f"{timestamp}_{gpass['name']}",
+                        )
                 else:
-                    guidellm_result = {
-                        "name": exp.name,
-                        "engine": "guidellm",
-                        "success": False,
-                        "stdout": "",
-                        "stderr": "vLLM server failed to start.",
-                    }
-                    results.append(guidellm_result)
+                    if vllm_result["success"]:
+                        guidellm_result = run_guidellm(exp, reports_dir, exp_id, timestamp)
+                        if not guidellm_result.get("success"):
+                            guidellm_result["failure_reason"] = extract_failure_reason(
+                                guidellm_result.get("stderr", "")
+                            )
+                        results.append(guidellm_result)
+                    else:
+                        guidellm_result = {
+                            "name": exp.name,
+                            "engine": "guidellm",
+                            "success": False,
+                            "stdout": "",
+                            "stderr": "vLLM server failed to start.",
+                            "failure_reason": vllm_result.get("failure_reason")
+                            or "vLLM server failed to start (no reason captured)",
+                            "server_log": vllm_result.get("server_log"),
+                        }
+                        results.append(guidellm_result)
 
-                guidellm_result["gpu_count"] = count
-                if on_rocm:
-                    guidellm_result["telemetry_dir"] = str(telemetry_dir)
-                save_experiment_result(guidellm_result, experiments_dir, exp_id, timestamp)
+                    guidellm_result["gpu_count"] = count
+                    guidellm_result["parallelism"] = parallelism_label(exp)
+                    guidellm_result["precision"] = exp.metadata.get("precision", "INT4")
+                    if on_rocm:
+                        guidellm_result["telemetry_dir"] = str(telemetry_dir)
+                    save_experiment_result(guidellm_result, experiments_dir, exp_id, timestamp)
 
-                stop_vllm_server(server_process)
+                if server_process is not None:
+                    stop_vllm_server(server_process)
             finally:
                 if sampler is not None:
                     sampler.stop()
@@ -852,6 +1052,14 @@ async def run_all_experiments(
     capture_records = [r for r in results if r.get("engine") == "gitm-capture"]
     if len({(r.get("serving") or {}).get("tracing") or r.get("arm") for r in capture_records}) > 1:
         console.print(render_overhead(overhead_rows(capture_records)))
+
+    # Every serving run ends with the InferenceX-standard metrics table:
+    # E2E / TTFT / ITL tails plus tok/s/user and tok/s/GPU, one row per
+    # (experiment, pass). Reads each guidellm report from disk, so it is
+    # accurate even when a pass failed or the server died mid-sweep.
+    from .serving_metrics import print_serving_metrics
+
+    print_serving_metrics(results)
 
     output_json = output_dir / "experiment_results.json"
     output_json.parent.mkdir(parents=True, exist_ok=True)
